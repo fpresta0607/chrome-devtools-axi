@@ -33,6 +33,11 @@ describe("getCommandHelp", () => {
     expect(getCommandHelp("nonexistent")).toBeNull();
   });
 
+  it("documents the offline security capability command", () => {
+    expect(getCommandHelp("security")).toContain("security --json");
+    expect(getCommandHelp("security")).toContain("without starting a bridge");
+  });
+
   it("includes --full flag for snapshot-producing commands", () => {
     for (const cmd of [
       "open",

@@ -2,7 +2,7 @@
  * Persistent MCP bridge server for chrome-devtools-axi.
  *
  * Selects either a local/proxy stdio session or a direct Streamable HTTP
- * session and maintains it persistently. Exposes a simple HTTP API:
+ * session and maintains it persistently. Exposes an authenticated HTTP API:
  *   POST /call  { name, args }  → { result }
  *   GET  /tools                 → [{ name, description }]
  *   GET  /health                → { status: "ok", session } or 503 { status: "error", error }
@@ -11,9 +11,7 @@
  *                                 chrome-devtools-mcp's one-shot reconnect marker *and*
  *                                 that dropped a persisted page selection
  *
- * Writes a PID file to the active session's state dir on startup
- * (~/.chrome-devtools-axi/bridge.pid for the default session; named sessions
- * nest under sessions/<name>/ - see src/sessions.ts).
+ * See README.md#bridge-security for the authentication and state boundary.
  */
 
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
@@ -21,7 +19,9 @@ import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js"
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import { ListRootsRequestSchema } from "@modelcontextprotocol/sdk/types.js";
 import type { Transport } from "@modelcontextprotocol/sdk/shared/transport.js";
+import { isUtf8 } from "node:buffer";
 import { execFileSync, execSync } from "node:child_process";
+import { randomBytes } from "node:crypto";
 import {
   createServer,
   type IncomingMessage,
@@ -32,21 +32,20 @@ import {
   accessSync,
   constants as fsConstants,
   existsSync,
-  mkdirSync,
-  readFileSync,
   statSync,
-  unlinkSync,
-  writeFileSync,
 } from "node:fs";
-import {
-  basename,
-  delimiter,
-  dirname,
-  isAbsolute,
-  join,
-  resolve,
-} from "node:path";
+import { basename, delimiter, isAbsolute, join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
+import {
+  createBridgeAuth,
+  RESPONSE_PROOF_HEADER,
+  type BridgeAuth,
+} from "./bridge-auth.js";
+import {
+  prepareSessionState,
+  removeBridgeState,
+  writeBridgeState,
+} from "./bridge-state.js";
 import {
   AMBIENT_REQUEST_HEADER,
   BRIDGE_PORT_IN_USE_EXIT_CODE,
@@ -60,11 +59,7 @@ import {
   type IdleTracker,
 } from "./idle.js";
 import { clearSelectedPageId } from "./selected-page.js";
-import {
-  resolveSessionName,
-  resolveSessionPidFile,
-  resolveSessionPort,
-} from "./sessions.js";
+import { resolveSessionName, resolveSessionPort } from "./sessions.js";
 
 // Re-exported so existing bridge consumers keep a single import surface; the
 // definitions live in the MCP-free ./bridge-script.js (see its header).
@@ -170,12 +165,6 @@ export async function isBridgeTargetReachable(
   }
 }
 
-function writePidFile(port: number): void {
-  const pidFile = resolveSessionPidFile();
-  mkdirSync(dirname(pidFile), { recursive: true });
-  writeFileSync(pidFile, JSON.stringify({ pid: process.pid, port }));
-}
-
 /**
  * Remove the session PID file, but only when this process owns it. On a
  * same-session bind race the losing bridge exits via EADDRINUSE after the
@@ -186,22 +175,13 @@ function writePidFile(port: number): void {
  * injectable for tests.
  */
 export function removePidFile(
-  pidFile: string = resolveSessionPidFile(),
   ownerPid: number = process.pid,
+  sessionName = resolveSessionName(),
 ): void {
   try {
-    const data = JSON.parse(readFileSync(pidFile, "utf-8")) as {
-      pid?: unknown;
-    };
-    if (data.pid !== ownerPid) return;
+    removeBridgeState(ownerPid, sessionName);
   } catch {
-    // Missing, unreadable, or malformed — nothing we own to remove.
-    return;
-  }
-  try {
-    unlinkSync(pidFile);
-  } catch {
-    // Already gone — fine
+    // Unverified state must remain untouched during shutdown.
   }
 }
 
@@ -210,10 +190,9 @@ export function getErrorMessage(error: unknown): string {
 }
 
 /**
- * Hostnames that identify the loopback interface. The bridge is a persistent
- * unauthenticated loopback service on a known port, so it is the target of
- * DNS-rebinding: a malicious page rebinds its own domain to 127.0.0.1 and the
- * browser then issues same-origin requests that hit the bridge. Binding to
+ * Hostnames that identify the loopback interface. A malicious page can rebind
+ * its own domain to 127.0.0.1, causing the browser to issue same-origin requests
+ * that hit the bridge. Binding to
  * 127.0.0.1 does NOT stop this - the packets still arrive on loopback. The one
  * thing a rebound request cannot hide is that it carries the attacker's own
  * domain in the `Host` (and `Origin`) header, and those are forbidden headers
@@ -437,12 +416,26 @@ function parseRootsField(roots: unknown): string[] | undefined {
   return roots as string[];
 }
 
+const MAX_REQUEST_BODY_BYTES = 16 * 1024 * 1024;
+
 async function readRequestBody(req: IncomingMessage): Promise<string> {
-  let body = "";
+  const chunks: Buffer[] = [];
+  let size = 0;
   for await (const chunk of req) {
-    body += typeof chunk === "string" ? chunk : chunk.toString("utf-8");
+    const buffer: Buffer =
+      typeof chunk === "string" ? Buffer.from(chunk) : chunk;
+    size += buffer.length;
+    // The body is read before its MAC can be checked, so an unauthenticated
+    // peer must not be able to make the bridge buffer without bound.
+    if (size > MAX_REQUEST_BODY_BYTES) {
+      req.destroy();
+      throw new Error("Invalid bridge request");
+    }
+    chunks.push(buffer);
   }
-  return body;
+  const body = Buffer.concat(chunks);
+  if (!isUtf8(body)) throw new Error("Invalid bridge request");
+  return body.toString("utf8");
 }
 
 function writeJson(
@@ -456,11 +449,10 @@ function writeJson(
 
 async function handleToolsRequest(
   client: BridgeClient,
-  res: ServerResponse,
+  respond: (status: number, payload: unknown) => void,
 ): Promise<void> {
   const result = await client.listTools();
-  writeJson(
-    res,
+  respond(
     200,
     result.tools.map((tool) => ({
       name: tool.name,
@@ -471,11 +463,10 @@ async function handleToolsRequest(
 
 async function handleCallRequest(
   client: BridgeClient,
-  req: IncomingMessage,
-  res: ServerResponse,
+  body: string,
+  respond: (status: number, payload: unknown) => void,
   onPageIdentityChanged?: () => boolean | void,
 ): Promise<void> {
-  const body = await readRequestBody(req);
   const payload = parseBridgeCallPayload(body);
   const result = await client.callTool(
     {
@@ -501,16 +492,16 @@ async function handleCallRequest(
   // degradation is intentional - rendering a snapshot resolved in a reissued
   // id space is exactly the silent retarget this branch exists to prevent.
   if (pageIdentityChanged && typeof payload.args.pageId === "number") {
-    writeJson(res, 200, { error: PAGE_IDENTITY_CHANGED_ERROR });
+    respond(200, { error: PAGE_IDENTITY_CHANGED_ERROR });
     return;
   }
   if (isToolResultError(result)) {
     // Surface the tool's own failure text as an error so the CLI throws and
     // exits non-zero instead of printing success (issue #96).
-    writeJson(res, 200, { error: text || `Tool "${payload.name}" failed` });
+    respond(200, { error: text || `Tool "${payload.name}" failed` });
     return;
   }
-  writeJson(res, 200, { result: text });
+  respond(200, { result: text });
 }
 
 export async function handleBridgeRequest(
@@ -520,6 +511,8 @@ export async function handleBridgeRequest(
   sessionName?: string,
   logForbidden?: (message: string) => void,
   onPageIdentityChanged?: () => boolean | void,
+  auth?: BridgeAuth,
+  onAuthenticated?: () => void,
 ): Promise<void> {
   res.setHeader("Content-Type", "application/json");
 
@@ -529,15 +522,37 @@ export async function handleBridgeRequest(
     // Log the refusal so an operator can tell a mis-configured client apart
     // from an actual rebinding attempt. Injected (not a direct
     // logBridgeMessage call) so unit tests stay quiet unless they opt in.
-    const rawOrigin = req.headers.origin;
-    const origin = Array.isArray(rawOrigin) ? rawOrigin[0] : rawOrigin;
-    logForbidden?.(
-      `Rejected request with disallowed host: host=${req.headers.host ?? ""} ` +
-        `origin=${origin ?? ""} ${req.method ?? ""} ${req.url ?? ""}`,
-    );
+    logForbidden?.("Rejected request with disallowed host or origin");
     writeJson(res, 403, { error: "Forbidden host" });
     return;
   }
+
+  if (!auth || typeof req.headers.authorization !== "string") {
+    writeJson(res, 401, { error: "Bridge authentication required" });
+    return;
+  }
+  let body: string;
+  try {
+    body = await readRequestBody(req);
+  } catch {
+    writeJson(res, 400, { error: "Invalid bridge request" });
+    return;
+  }
+  const authorization = auth.authenticate(req, body);
+  if (!authorization) {
+    writeJson(res, 401, { error: "Bridge authentication required" });
+    return;
+  }
+  onAuthenticated?.();
+  const respond = (status: number, payload: unknown) => {
+    const responseBody = JSON.stringify(payload);
+    res.setHeader(
+      RESPONSE_PROOF_HEADER,
+      auth.signResponse(authorization, status, responseBody),
+    );
+    res.statusCode = status;
+    res.end(responseBody);
+  };
 
   try {
     if (
@@ -545,7 +560,7 @@ export async function handleBridgeRequest(
       (req.url === "/health" || req.url?.startsWith("/health?"))
     ) {
       if (!(await isBridgeClientConnected(client))) {
-        writeJson(res, 503, { status: "error", error: "Not connected" });
+        respond(503, { status: "error", error: "Not connected" });
         return;
       }
       const deep = req.url.includes("deep=1");
@@ -553,7 +568,7 @@ export async function handleBridgeRequest(
       if (deep) {
         const probe = await isBridgeTargetReachable(client);
         if (!probe.ok) {
-          writeJson(res, 503, {
+          respond(503, {
             status: "error",
             error: "CDP target unreachable",
             reason: probe.reason,
@@ -570,7 +585,7 @@ export async function handleBridgeRequest(
       // Absent on a shallow probe and on a reconnect that dropped nothing, so
       // the CLI reads its absence as "no routing was lost" rather than "old
       // bridge".
-      writeJson(res, 200, {
+      respond(200, {
         status: "ok",
         session: sessionName,
         ...(droppedSelection ? { pageIdentityChanged: true } : {}),
@@ -579,25 +594,27 @@ export async function handleBridgeRequest(
     }
 
     if (req.method === "GET" && req.url === "/tools") {
-      await handleToolsRequest(client, res);
+      await handleToolsRequest(client, respond);
       return;
     }
 
     if (req.method === "POST" && req.url === "/call") {
-      await handleCallRequest(client, req, res, onPageIdentityChanged);
+      await handleCallRequest(client, body, respond, onPageIdentityChanged);
       return;
     }
   } catch (error) {
-    writeJson(res, 500, { error: getErrorMessage(error) });
+    respond(500, { error: getErrorMessage(error) });
     return;
   }
 
-  writeJson(res, 404, { error: "not found" });
+  respond(404, { error: "not found" });
 }
 
 /**
- * Whether a finished request renews an opted-in idle timeout: any request the
- * anti-rebinding gate accepts, except the CLI's ambient home-view probe.
+ * Whether an already authenticated request renews an opted-in idle timeout.
+ * The ambient home-view probe must not keep an abandoned bridge alive.
+ * The deep health probe before a command does renew it, preventing shutdown
+ * between that probe and the command's own call.
  */
 export function isIdleActivity(req: IncomingMessage): boolean {
   return isRequestAllowed(req) && req.headers[AMBIENT_REQUEST_HEADER] !== "1";
@@ -607,10 +624,17 @@ export function createBridgeServer(
   client: BridgeClient,
   sessionName?: string,
   idle?: IdleTracker,
+  auth?: BridgeAuth,
 ): Server {
   return createServer((req, res) => {
-    const end = idle?.begin();
-    if (end) res.once("close", () => end(isIdleActivity(req)));
+    // Only an authenticated request is in flight for idle shutdown, so another
+    // user's unfinished request cannot keep an idle bridge alive.
+    let end: ((activity: boolean) => void) | undefined;
+    let is_closed = false;
+    res.once("close", () => {
+      is_closed = true;
+      end?.(isIdleActivity(req));
+    });
     void handleBridgeRequest(
       client,
       req,
@@ -618,6 +642,10 @@ export function createBridgeServer(
       sessionName,
       logBridgeMessage,
       clearSelectedPageId,
+      auth,
+      () => {
+        if (!is_closed) end = idle?.begin();
+      },
     );
   });
 }
@@ -830,6 +858,7 @@ const DEFAULT_MCP_PATH_PROBE: McpPathProbe = {
     try {
       return execSync("npm prefix -g", {
         encoding: "utf8",
+        windowsHide: true,
         stdio: ["ignore", "pipe", "ignore"],
       }).trim();
     } catch {
@@ -929,6 +958,7 @@ export function resolveTransportSpec(
     try {
       help = execFileSync(process.execPath, [explicitPath, "--help"], {
         encoding: "utf8",
+        windowsHide: true,
         stdio: ["ignore", "pipe", "pipe"],
         timeout: 5_000,
         killSignal: "SIGKILL",
@@ -1163,6 +1193,7 @@ export function createRootsAwareBridgeClient(client: Client): RootsAwareClient {
 }
 
 async function closeServer(server: Server): Promise<void> {
+  if (!server.listening) return;
   await new Promise<void>((resolve, reject) => {
     server.close((error) => {
       if (error) {
@@ -1171,10 +1202,14 @@ async function closeServer(server: Server): Promise<void> {
         resolve();
       }
     });
+    server.closeAllConnections();
   });
 }
 
 export async function runBridge(port = resolveSessionPort()): Promise<void> {
+  const sessionName = resolveSessionName();
+  prepareSessionState(sessionName);
+  const secret = randomBytes(32).toString("hex");
   // Connect the selected MCP transport before binding the port. In local and
   // proxy modes this may spawn chrome-devtools-mcp; URL-only shared mode
   // connects directly to the existing Streamable HTTP endpoint. A same-session
@@ -1185,38 +1220,40 @@ export async function runBridge(port = resolveSessionPort()): Promise<void> {
   const bridgeTransport = createTransport();
   const client = createBridgeClient();
   const bridgeClient = createRootsAwareBridgeClient(client);
-  await client.connect(bridgeTransport.transport);
+  try {
+    await client.connect(bridgeTransport.transport);
+  } catch (error) {
+    await closeBridgeTransport(bridgeTransport);
+    throw error;
+  }
   logBridgeMessage("Connected to chrome-devtools-mcp");
 
-  const sessionName = resolveSessionName();
   const idleTimeoutMs = resolveIdleTimeoutMs();
   const idle =
     idleTimeoutMs > 0
       ? createIdleTracker(idleTimeoutMs, () => {
           logBridgeMessage(
-            `No activity for ${idleTimeoutMs}ms (${IDLE_TIMEOUT_ENV}); shutting down`,
+            `No activity for ${idleTimeoutMs}ms (${IDLE_TIMEOUT_ENV}). Shutting down`,
           );
           void shutdown();
         })
       : undefined;
-  const server = createBridgeServer(bridgeClient, sessionName, idle);
-  server.on("error", (error: NodeJS.ErrnoException) => {
-    handleBridgeServerError(error, port);
-  });
-  server.listen(port, "127.0.0.1", () => {
-    writePidFile(port);
-    logBridgeMessage(`Listening on http://127.0.0.1:${port}`);
-    writeReadySignal();
-  });
+  const server = createBridgeServer(
+    bridgeClient,
+    sessionName,
+    idle,
+    createBridgeAuth(secret),
+  );
+  const finishStartup = idle?.begin();
 
   let shuttingDown = false;
-  const shutdown = async () => {
+  const shutdown = async (exitCode = 0) => {
     if (shuttingDown) return;
     shuttingDown = true;
     removePidFile();
     await closeServer(server);
     await closeBridgeTransport(bridgeTransport);
-    process.exit(0);
+    process.exit(exitCode);
   };
 
   // Once a stdio chrome-devtools-mcp (local or proxy) is gone - crashed,
@@ -1249,5 +1286,21 @@ export async function runBridge(port = resolveSessionPort()): Promise<void> {
   });
   process.on("SIGINT", () => {
     void shutdown();
+  });
+  server.on("error", (error: NodeJS.ErrnoException) => {
+    handleBridgeServerError(error, port, (code) => {
+      void shutdown(code);
+    });
+  });
+  server.listen(port, "127.0.0.1", () => {
+    try {
+      writeBridgeState(port, secret, sessionName);
+      finishStartup?.(true);
+      logBridgeMessage(`Listening on http://127.0.0.1:${port}`);
+      writeReadySignal();
+    } catch {
+      logBridgeMessage("Could not establish protected bridge state");
+      void shutdown(1);
+    }
   });
 }

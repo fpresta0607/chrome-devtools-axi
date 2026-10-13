@@ -54,6 +54,25 @@ async function reconnectClearedError(): Promise<CdpError> {
 }
 
 describe("main", () => {
+  it("reports the Windows security capability as one offline JSON object", async () => {
+    const write = vi
+      .spyOn(process.stdout, "write")
+      .mockImplementation(() => true);
+
+    await main(["security", "--json"]);
+
+    const output = write.mock.calls.map(([chunk]) => String(chunk)).join("");
+    expect(JSON.parse(output)).toEqual({
+      version: expect.any(String),
+      platform: process.platform,
+      bridge_transport:
+        process.platform === "win32" ? "windows-user-v1" : "user-v1",
+    });
+    expect(callTool).not.toHaveBeenCalled();
+    expect(getSessionSnapshotIfRunning).not.toHaveBeenCalled();
+    expect(process.exitCode ?? 0).toBe(0);
+  });
+
   afterEach(() => {
     callTool.mockReset();
     process.exitCode = undefined;
@@ -754,6 +773,7 @@ describe("main", () => {
 
 describe("pages selected overlay", () => {
   const savedHome = process.env.HOME;
+  const savedUserProfile = process.env.USERPROFILE;
   const savedSession = process.env.CHROME_DEVTOOLS_AXI_SESSION;
   let tmpHome = "";
 
@@ -763,6 +783,8 @@ describe("pages selected overlay", () => {
     vi.restoreAllMocks();
     if (savedHome === undefined) delete process.env.HOME;
     else process.env.HOME = savedHome;
+    if (savedUserProfile === undefined) delete process.env.USERPROFILE;
+    else process.env.USERPROFILE = savedUserProfile;
     if (savedSession === undefined) {
       delete process.env.CHROME_DEVTOOLS_AXI_SESSION;
     } else {
@@ -774,6 +796,7 @@ describe("pages selected overlay", () => {
   function isolateSession(): void {
     tmpHome = mkdtempSync(join(tmpdir(), "axi-pages-"));
     process.env.HOME = tmpHome;
+    process.env.USERPROFILE = tmpHome;
     process.env.CHROME_DEVTOOLS_AXI_SESSION = "pages-overlay";
   }
 

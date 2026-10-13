@@ -29,6 +29,7 @@ beforeAll(() => {
     const built = spawnSync("pnpm", ["run", "build"], {
       cwd: ROOT,
       encoding: "utf8",
+      windowsHide: true,
     });
     expect(built.status, built.stderr).toBe(0);
   }
@@ -46,8 +47,12 @@ function traceModules(
       ["--import", TRACE_REGISTER, ...args],
       {
         encoding: "utf8",
+        windowsHide: true,
         env: {
           ...process.env,
+          HOME: dir,
+          USERPROFILE: dir,
+          CHROME_DEVTOOLS_AXI_SESSION: "module-trace",
           ...env,
           CHROME_DEVTOOLS_AXI_MODULE_TRACE: tracePath,
         },
@@ -71,6 +76,7 @@ describe("--version path", () => {
   it("prints the package version and exits 0", () => {
     const result = spawnSync(process.execPath, [CLI_BIN, "--version"], {
       encoding: "utf8",
+      windowsHide: true,
     });
     expect(result.status).toBe(0);
     expect(result.stdout).toBe(`${pkg.version}\n`);
@@ -115,6 +121,7 @@ describe("--version path", () => {
     (flag) => {
       const result = spawnSync(process.execPath, [CLI_BIN, flag], {
         encoding: "utf8",
+        windowsHide: true,
       });
       expect(result.status).toBe(0);
       expect(result.stdout).toBe(`${pkg.version}\n`);

@@ -1,13 +1,9 @@
 /**
  * Opt-in idle shutdown for the detached bridge.
  *
- * By default a bridge lives until `stop`. `CHROME_DEVTOOLS_AXI_IDLE_TIMEOUT_MS`
- * opts a bridge into shutting itself down once that many milliseconds pass
- * with no activity and no request in flight. Activity is any request the
- * bridge accepts except an ambient probe (`AMBIENT_REQUEST_HEADER`), so the
- * SessionStart home view cannot keep an abandoned bridge alive, while the deep
- * health probe `ensureBridge` sends before every command does renew it and so
- * cannot race the command's own `/call`.
+ * See README.md#idle-timeout for configuration and activity semantics.
+ * Authentication and activity classification belong to createBridgeServer
+ * and isIdleActivity in src/bridge.ts.
  */
 
 export const IDLE_TIMEOUT_ENV = "CHROME_DEVTOOLS_AXI_IDLE_TIMEOUT_MS";

@@ -1,17 +1,25 @@
-import { describe, expect, it, beforeEach, afterEach } from "vitest";
-import { spawn } from "node:child_process";
-import { EventEmitter } from "node:events";
-import { createServer, type Server } from "node:http";
-import { AddressInfo } from "node:net";
+import { describe, expect, it, beforeEach, afterEach, vi } from "vitest";
+import { execFileSync, spawn } from "node:child_process";
+import { EventEmitter, once } from "node:events";
 import {
+  createServer,
+  type Server,
+  type IncomingMessage,
+  type ServerResponse,
+} from "node:http";
+import { AddressInfo, type Socket } from "node:net";
+import {
+  chmodSync,
+  existsSync,
   mkdtempSync,
   mkdirSync,
   readFileSync,
   rmSync,
+  unlinkSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { AxiError } from "axi-sdk-js";
 import {
   BRIDGE_PORT_IN_USE_EXIT_CODE,
@@ -20,6 +28,48 @@ import {
   type BridgeClient,
 } from "../src/bridge.js";
 import { AMBIENT_REQUEST_HEADER } from "../src/bridge-script.js";
+import { createBridgeAuth, RESPONSE_PROOF_HEADER } from "../src/bridge-auth.js";
+import { writeBridgeState } from "../src/bridge-state.js";
+
+vi.mock("node:child_process", async (importOriginal) => {
+  const childProcess =
+    await importOriginal<typeof import("node:child_process")>();
+  return { ...childProcess, execFileSync: vi.fn(childProcess.execFileSync) };
+});
+
+const windowsAcl = vi.hoisted(() => ({
+  isWindowsBridgeProcess: vi.fn((_pid: number, _port: number) => false),
+  verifyWindowsState: vi.fn(),
+}));
+vi.mock("../src/windows-acl.js", () => ({
+  secureWindowsPaths: (paths: string[], mode: string) => {
+    if (mode === "prepare-directory")
+      paths.forEach((path) => mkdirSync(path, { recursive: true }));
+  },
+  secureWindowsPath: (path: string, mode: string) => {
+    if (mode === "prepare-directory") mkdirSync(path, { recursive: true });
+  },
+  verifyWindowsState: windowsAcl.verifyWindowsState,
+  isWindowsBridgeProcess: windowsAcl.isWindowsBridgeProcess,
+}));
+
+const AUTH_SECRET = "a".repeat(64);
+const RESPONSE_AUTH = createBridgeAuth(AUTH_SECRET);
+function signFakeResponse(req: IncomingMessage, res: ServerResponse): void {
+  const end = res.end.bind(res);
+  res.end = ((body: string) => {
+    res.setHeader(
+      RESPONSE_PROOF_HEADER,
+      RESPONSE_AUTH.signResponse(
+        req.headers.authorization ?? "",
+        res.statusCode,
+        body,
+      ),
+    );
+    return end(body);
+  }) as typeof res.end;
+}
+
 import { setSelectedPageId } from "../src/selected-page.js";
 import {
   buildBridgeEarlyExitError,
@@ -173,6 +223,7 @@ function startFakeBridgeServer(opts: FakeBridgeOptions): Promise<{
 }> {
   return new Promise((resolveStart, rejectStart) => {
     const server = createServer((req, res) => {
+      signFakeResponse(req, res);
       if (req.method === "GET" && req.url?.startsWith("/health")) {
         const wantsDeep = req.url.includes("deep=1");
         const outcome = wantsDeep ? opts.deep : opts.shallow;
@@ -212,12 +263,136 @@ function startFakeBridgeServer(opts: FakeBridgeOptions): Promise<{
 }
 
 describe("checkBridgeHealth (deep probe)", () => {
+  it("rejects invalid UTF-8 response bytes even when their replacement text has a valid proof", async () => {
+    const server = createServer((req, res) => {
+      const body = JSON.stringify({ status: "ok", message: "\ufffd" });
+      const wireBody = Buffer.from(body.replace("\ufffd", "x"));
+      wireBody[wireBody.indexOf("x")] = 0xff;
+      res.setHeader(
+        RESPONSE_PROOF_HEADER,
+        RESPONSE_AUTH.signResponse(req.headers.authorization ?? "", 200, body),
+      );
+      res.end(wireBody);
+    });
+    await new Promise<void>((ready) => server.listen(0, "127.0.0.1", ready));
+    try {
+      const { port } = server.address() as AddressInfo;
+
+      await expect(
+        checkBridgeHealth(port, { secret: AUTH_SECRET }),
+      ).rejects.toThrow("Bridge authentication failed");
+    } finally {
+      await new Promise<void>((closed) => server.close(() => closed()));
+    }
+  });
+
+  it("gives up on a peer that trickles its response past the deadline", async () => {
+    const server = createServer((_req, res) => {
+      res.writeHead(200);
+      const timer = setInterval(() => res.write(" "), 100);
+      res.on("close", () => clearInterval(timer));
+    });
+    await new Promise<void>((ready) => server.listen(0, "127.0.0.1", ready));
+    try {
+      const { port } = server.address() as AddressInfo;
+      const started = Date.now();
+
+      await expect(
+        checkBridgeHealth(port, { secret: AUTH_SECRET }),
+      ).resolves.toBe(false);
+      expect(Date.now() - started).toBeLessThan(4_000);
+    } finally {
+      server.closeAllConnections();
+      await new Promise<void>((closed) => server.close(() => closed()));
+    }
+  }, 10_000);
+
+  it("stops buffering an unbounded response before verifying it", async () => {
+    const chunk = Buffer.alloc(1024 * 1024, 0x61);
+    let sent = 0;
+    const server = createServer((_req, res) => {
+      res.writeHead(200);
+      const pump = () => {
+        while (!res.destroyed) {
+          sent += chunk.length;
+          if (!res.write(chunk)) return;
+        }
+      };
+      res.on("drain", pump);
+      pump();
+    });
+    await new Promise<void>((ready) => server.listen(0, "127.0.0.1", ready));
+    try {
+      const { port } = server.address() as AddressInfo;
+
+      await expect(
+        checkBridgeHealth(port, { secret: AUTH_SECRET }),
+      ).resolves.toBe(false);
+      expect(sent).toBeLessThan(128 * 1024 * 1024);
+    } finally {
+      server.closeAllConnections();
+      await new Promise<void>((closed) => server.close(() => closed()));
+    }
+  }, 10_000);
+
+  it("rejects unsigned health from a port squatter without exposing the state secret", async () => {
+    let observedHeaders = "";
+    const server = createServer((req, res) => {
+      observedHeaders = JSON.stringify(req.headers);
+      res.end(JSON.stringify({ status: "ok", session: "worker-1" }));
+    });
+    await new Promise<void>((ready) => server.listen(0, "127.0.0.1", ready));
+    try {
+      const { port } = server.address() as AddressInfo;
+      await expect(
+        checkBridgeHealth(port, {
+          secret: AUTH_SECRET,
+          expectedSession: "worker-1",
+        }),
+      ).rejects.toThrow("Bridge authentication failed");
+      expect(observedHeaders).not.toContain(AUTH_SECRET);
+    } finally {
+      await new Promise<void>((closed) => server.close(() => closed()));
+    }
+  });
+
   it("returns true on a shallow probe when /health responds 200 ok", async () => {
     const fake = await startFakeBridgeServer({ shallow: "ok", deep: "error" });
     try {
-      expect(await checkBridgeHealth(fake.port)).toBe(true);
+      expect(await checkBridgeHealth(fake.port, { secret: AUTH_SECRET })).toBe(
+        true,
+      );
     } finally {
       await fake.close();
+    }
+  });
+
+  it("accepts a complete signed response delimited by connection closure", async () => {
+    const server = createServer((request, response) => {
+      const body = JSON.stringify({ status: "ok" });
+      response.setHeader(
+        RESPONSE_PROOF_HEADER,
+        RESPONSE_AUTH.signResponse(
+          request.headers.authorization ?? "",
+          200,
+          body,
+        ),
+      );
+      response.setHeader("Connection", "close");
+      response.useChunkedEncodingByDefault = false;
+      response.write(body);
+      response.end();
+    });
+    await new Promise<void>((ready) => server.listen(0, "127.0.0.1", ready));
+    try {
+      const { port } = server.address() as AddressInfo;
+
+      await expect(
+        checkBridgeHealth(port, { secret: AUTH_SECRET }),
+      ).resolves.toBe(true);
+    } finally {
+      server.closeAllConnections();
+      await new Promise<void>((closed) => server.close(() => closed()));
     }
   });
 
@@ -227,8 +402,12 @@ describe("checkBridgeHealth (deep probe)", () => {
     // deep probe correctly reports unhealthy.
     const fake = await startFakeBridgeServer({ shallow: "ok", deep: "error" });
     try {
-      expect(await checkBridgeHealth(fake.port)).toBe(true);
-      expect(await checkBridgeHealth(fake.port, { deep: true })).toBe(false);
+      expect(await checkBridgeHealth(fake.port, { secret: AUTH_SECRET })).toBe(
+        true,
+      );
+      expect(
+        await checkBridgeHealth(fake.port, { secret: AUTH_SECRET, deep: true }),
+      ).toBe(false);
     } finally {
       await fake.close();
     }
@@ -237,7 +416,9 @@ describe("checkBridgeHealth (deep probe)", () => {
   it("returns true on the deep probe when the bridge reports both layers healthy", async () => {
     const fake = await startFakeBridgeServer({ shallow: "ok", deep: "ok" });
     try {
-      expect(await checkBridgeHealth(fake.port, { deep: true })).toBe(true);
+      expect(
+        await checkBridgeHealth(fake.port, { secret: AUTH_SECRET, deep: true }),
+      ).toBe(true);
     } finally {
       await fake.close();
     }
@@ -250,7 +431,9 @@ describe("checkBridgeHealth (deep probe)", () => {
       deepDelayMs: 2200,
     });
     try {
-      expect(await checkBridgeHealth(fake.port, { deep: true })).toBe(true);
+      expect(
+        await checkBridgeHealth(fake.port, { secret: AUTH_SECRET, deep: true }),
+      ).toBe(true);
     } finally {
       await fake.close();
     }
@@ -258,8 +441,10 @@ describe("checkBridgeHealth (deep probe)", () => {
 
   it("returns false when nothing is listening on the port", async () => {
     // Port 1 is privileged and unbound — connection should be refused immediately.
-    expect(await checkBridgeHealth(1)).toBe(false);
-    expect(await checkBridgeHealth(1, { deep: true })).toBe(false);
+    expect(await checkBridgeHealth(1, { secret: AUTH_SECRET })).toBe(false);
+    expect(
+      await checkBridgeHealth(1, { secret: AUTH_SECRET, deep: true }),
+    ).toBe(false);
   });
 
   it("treats a session-name mismatch as unhealthy (another session's bridge)", async () => {
@@ -270,28 +455,38 @@ describe("checkBridgeHealth (deep probe)", () => {
     });
     try {
       expect(
-        await checkBridgeHealth(fake.port, { expectedSession: "worker-2" }),
+        await checkBridgeHealth(fake.port, {
+          secret: AUTH_SECRET,
+          expectedSession: "worker-2",
+        }),
       ).toBe(false);
       expect(
         await checkBridgeHealth(fake.port, {
+          secret: AUTH_SECRET,
           deep: true,
           expectedSession: "worker-2",
         }),
       ).toBe(false);
       expect(
-        await checkBridgeHealth(fake.port, { expectedSession: "worker-1" }),
+        await checkBridgeHealth(fake.port, {
+          secret: AUTH_SECRET,
+          expectedSession: "worker-1",
+        }),
       ).toBe(true);
     } finally {
       await fake.close();
     }
   });
 
-  it("accepts a bridge that omits the session field (older version)", async () => {
+  it("rejects a bridge that omits the session field (older version)", async () => {
     const fake = await startFakeBridgeServer({ shallow: "ok", deep: "ok" });
     try {
       expect(
-        await checkBridgeHealth(fake.port, { expectedSession: "worker-1" }),
-      ).toBe(true);
+        await checkBridgeHealth(fake.port, {
+          secret: AUTH_SECRET,
+          expectedSession: "worker-1",
+        }),
+      ).toBe(false);
     } finally {
       await fake.close();
     }
@@ -399,6 +594,7 @@ describe("buildBridgeEarlyExitError", () => {
 describe("ensureBridge early-exit fast-fail", () => {
   const savedSession = process.env.CHROME_DEVTOOLS_AXI_SESSION;
   const savedHome = process.env.HOME;
+  const savedUserProfile = process.env.USERPROFILE;
   const savedTimeout = process.env.CHROME_DEVTOOLS_AXI_BRIDGE_TIMEOUT_MS;
   const savedPort = process.env.CHROME_DEVTOOLS_AXI_PORT;
   let tmpHome: string;
@@ -413,6 +609,7 @@ describe("ensureBridge early-exit fast-fail", () => {
     // ensureBridge is forced down the spawn-a-new-bridge path.
     tmpHome = mkdtempSync(join(tmpdir(), "axi-ensure-bridge-"));
     process.env.HOME = tmpHome;
+    process.env.USERPROFILE = tmpHome;
     process.env.CHROME_DEVTOOLS_AXI_SESSION = "early-exit-worker";
     delete process.env.CHROME_DEVTOOLS_AXI_PORT;
     // A long deadline so the assertion proves the *early-exit* path returns
@@ -423,37 +620,209 @@ describe("ensureBridge early-exit fast-fail", () => {
   afterEach(() => {
     restore("CHROME_DEVTOOLS_AXI_SESSION", savedSession);
     restore("HOME", savedHome);
+    restore("USERPROFILE", savedUserProfile);
     restore("CHROME_DEVTOOLS_AXI_BRIDGE_TIMEOUT_MS", savedTimeout);
     restore("CHROME_DEVTOOLS_AXI_PORT", savedPort);
     rmSync(tmpHome, { recursive: true, force: true });
   });
 
-  it("fails fast with a port-collision error when the bridge exits with the EADDRINUSE code", async () => {
-    const start = Date.now();
-    let caught: unknown;
-    try {
-      await ensureBridge(() => {
-        const fake = new EventEmitter();
-        // Emit *after* ensureBridge attaches its exit listener.
-        setImmediate(() =>
-          fake.emit("exit", BRIDGE_PORT_IN_USE_EXIT_CODE, null),
-        );
-        return fake as unknown as SpawnedBridge;
-      });
-    } catch (error) {
-      caught = error;
-    }
-    const elapsed = Date.now() - start;
+  it.each([
+    { timeoutMs: 1000, minimumWaitMs: 1000, maximumWaitMs: 4000 },
+    { timeoutMs: 20000, minimumWaitMs: 5000, maximumWaitMs: 8000 },
+  ])(
+    "bounds the collision grace within a $timeoutMs ms readiness deadline",
+    async ({ timeoutMs, minimumWaitMs, maximumWaitMs }) => {
+      process.env.CHROME_DEVTOOLS_AXI_BRIDGE_TIMEOUT_MS = String(timeoutMs);
+      const start = Date.now();
+      let caught: unknown;
+      try {
+        await ensureBridge(() => {
+          const fake = new EventEmitter();
+          // Emit *after* ensureBridge attaches its exit listener.
+          setImmediate(() =>
+            fake.emit("exit", BRIDGE_PORT_IN_USE_EXIT_CODE, null),
+          );
+          return fake as unknown as SpawnedBridge;
+        });
+      } catch (error) {
+        caught = error;
+      }
+      const elapsed = Date.now() - start;
 
-    expect(caught).toBeInstanceOf(CdpError);
-    expect((caught as CdpError).code).toBe("BRIDGE_NOT_READY");
-    expect((caught as CdpError).message).toContain("before becoming ready");
-    expect((caught as CdpError).suggestions.join("\n")).toContain(
-      "CHROME_DEVTOOLS_AXI_PORT",
-    );
-    // The whole point: detecting the early exit must beat the 20s deadline.
-    expect(elapsed).toBeLessThan(5000);
-  });
+      expect(caught).toBeInstanceOf(CdpError);
+      expect((caught as CdpError).code).toBe("BRIDGE_NOT_READY");
+      expect((caught as CdpError).message).toContain("before becoming ready");
+      expect((caught as CdpError).suggestions.join("\n")).toContain(
+        "CHROME_DEVTOOLS_AXI_PORT",
+      );
+      expect(elapsed).toBeGreaterThanOrEqual(minimumWaitMs);
+      expect(elapsed).toBeLessThan(maximumWaitMs);
+    },
+    10_000,
+  );
+
+  it.each([
+    ["shallow health", "upgrade"],
+    ["deep health", "upgrade"],
+    ["tool call", "upgrade"],
+    ["ambient health", "upgrade"],
+    ["ambient snapshot", "upgrade"],
+    ["shallow health", "truncated"],
+    ["deep health", "truncated"],
+    ["tool call", "truncated"],
+    ["ambient health", "truncated"],
+    ["ambient snapshot", "truncated"],
+  ])(
+    "settles %s on an untrusted %s response",
+    async (consumer, responseType) => {
+      const sockets = new Set<Socket>();
+      let upgradedSocket: Socket | undefined;
+      const requests: string[] = [];
+      const should_fail_call =
+        consumer === "tool call" || consumer === "ambient snapshot";
+      const server = createServer((request, response) => {
+        requests.push(`${request.method} ${request.url}`);
+        if (should_fail_call && request.url?.startsWith("/health")) {
+          signFakeResponse(request, response);
+          response.end(
+            JSON.stringify({ status: "ok", session: "early-exit-worker" }),
+          );
+        } else if (responseType === "upgrade") {
+          upgradedSocket = request.socket;
+          response.writeHead(101, {
+            Connection: "Upgrade",
+            Upgrade: "websocket",
+          });
+          response.end();
+        } else {
+          response.writeHead(200, { "Content-Length": "1024" });
+          response.write("{");
+          response.socket?.end();
+        }
+      });
+      server.on("connection", (socket) => {
+        sockets.add(socket);
+        socket.once("close", () => sockets.delete(socket));
+      });
+      await new Promise<void>((ready) => server.listen(0, "127.0.0.1", ready));
+      const { port } = server.address() as AddressInfo;
+      writeBridgeState(port, AUTH_SECRET, "early-exit-worker");
+      setSelectedPageId(1);
+      let deadline: ReturnType<typeof setTimeout> | undefined;
+      try {
+        const operation = consumer.startsWith("ambient")
+          ? getSessionSnapshotIfRunning()
+          : consumer === "tool call"
+            ? callTool("list_pages")
+            : checkBridgeHealth(port, {
+                secret: AUTH_SECRET,
+                deep: consumer === "deep health",
+              });
+        const bounded = Promise.race([
+          operation,
+          new Promise<never>((_resolve, reject) => {
+            deadline = setTimeout(
+              () => reject(new Error("Bridge request did not settle")),
+              2500,
+            );
+          }),
+        ]);
+
+        if (consumer.startsWith("ambient")) {
+          await expect(bounded).resolves.toBeNull();
+        } else {
+          await expect(bounded).rejects.toThrow("Bridge authentication failed");
+        }
+        expect(requests).toEqual(
+          should_fail_call
+            ? [
+                consumer === "tool call" ? "GET /health?deep=1" : "GET /health",
+                "POST /call",
+              ]
+            : [
+                consumer === "deep health"
+                  ? "GET /health?deep=1"
+                  : "GET /health",
+              ],
+        );
+        if (responseType === "upgrade") {
+          await expect.poll(() => upgradedSocket?.destroyed).toBe(true);
+        }
+      } finally {
+        clearTimeout(deadline);
+        for (const socket of sockets) socket.destroy();
+        server.closeAllConnections();
+        await new Promise<void>((closed) => server.close(() => closed()));
+      }
+    },
+  );
+
+  it.each(["ready", "wrong session", "wrong key", "unhealthy target"])(
+    "waits for state published after a bind collision and checks a %s winner",
+    async (outcome) => {
+      process.env.CHROME_DEVTOOLS_AXI_BRIDGE_TIMEOUT_MS = "2000";
+      let healthRequests = 0;
+      const winner = createServer((request, response) => {
+        healthRequests++;
+        const is_healthy =
+          outcome !== "unhealthy target" || request.url === "/health";
+        const body = JSON.stringify({
+          status: is_healthy ? "ok" : "error",
+          session:
+            outcome === "wrong session"
+              ? "another-worker"
+              : "early-exit-worker",
+        });
+        response.statusCode = is_healthy ? 200 : 503;
+        response.setHeader(
+          RESPONSE_PROOF_HEADER,
+          createBridgeAuth(
+            outcome === "wrong key" ? "b".repeat(64) : AUTH_SECRET,
+          ).signResponse(
+            request.headers.authorization ?? "",
+            response.statusCode,
+            body,
+          ),
+        );
+        response.end(body);
+      });
+      await new Promise<void>((ready) => winner.listen(0, "127.0.0.1", ready));
+      const { port } = winner.address() as AddressInfo;
+      process.env.CHROME_DEVTOOLS_AXI_PORT = String(port);
+      let publication: ReturnType<typeof setTimeout> | undefined;
+      let has_loser_exited = false;
+      try {
+        const operation = ensureBridge(() => {
+          const loser = new EventEmitter();
+          setImmediate(() => {
+            has_loser_exited = true;
+            loser.emit("exit", BRIDGE_PORT_IN_USE_EXIT_CODE, null);
+            publication = setTimeout(() => {
+              writeBridgeState(port, AUTH_SECRET, "early-exit-worker");
+            }, 650);
+          });
+          return loser;
+        });
+
+        if (outcome === "ready") {
+          await expect(operation).resolves.toBe(port);
+        } else {
+          await expect(operation).rejects.toMatchObject({
+            code: "BRIDGE_NOT_READY",
+            suggestions: expect.arrayContaining([
+              expect.stringContaining("CHROME_DEVTOOLS_AXI_PORT"),
+            ]),
+          });
+        }
+        expect(has_loser_exited).toBe(true);
+        expect(healthRequests).toBeGreaterThan(0);
+      } finally {
+        clearTimeout(publication);
+        winner.closeAllConnections();
+        await new Promise<void>((closed) => winner.close(() => closed()));
+      }
+    },
+  );
 
   it("fails fast with generic startup guidance for a non-EADDRINUSE early exit", async () => {
     const start = Date.now();
@@ -476,12 +845,372 @@ describe("ensureBridge early-exit fast-fail", () => {
     expect(elapsed).toBeLessThan(5000);
   });
 
+  it("replaces a force-killed bridge without probing its successor with the stale key", async () => {
+    const session = "early-exit-worker";
+    const newSecret = "c".repeat(64);
+    const pages = {
+      content: [{ type: "text", text: "## Pages\n1: about:blank [selected]" }],
+    };
+    const deadBrowser = createBridgeServer(
+      {
+        listTools: async () => ({ tools: [] }),
+        callTool: async () => ({
+          isError: true,
+          content: [{ type: "text", text: "Target closed" }],
+        }),
+        close: async () => {},
+      },
+      session,
+      undefined,
+      createBridgeAuth(AUTH_SECRET),
+    );
+    await new Promise<void>((r) => deadBrowser.listen(0, "127.0.0.1", r));
+    const port = (deadBrowser.address() as AddressInfo).port;
+    process.env.CHROME_DEVTOOLS_AXI_PORT = String(port);
+    const oldBridge = spawn(
+      process.execPath,
+      [resolve("test/fixtures/legacy/chrome-devtools-axi-bridge.js")],
+      { stdio: "ignore", windowsHide: true },
+    );
+    await new Promise((started) => oldBridge.once("spawn", started));
+    const oldExit = new Promise((exited) => oldBridge.once("exit", exited));
+    writeBridgeState(port, AUTH_SECRET, session, oldBridge.pid as number);
+    windowsAcl.isWindowsBridgeProcess.mockImplementation(
+      (pid) => pid === oldBridge.pid,
+    );
+    const successor = createBridgeServer(
+      {
+        listTools: async () => ({ tools: [] }),
+        callTool: async () => pages,
+        close: async () => {},
+      },
+      session,
+      undefined,
+      createBridgeAuth(newSecret),
+    );
+
+    try {
+      const resolvedPort = await ensureBridge(() => {
+        deadBrowser.closeAllConnections();
+        deadBrowser.close(() => {
+          successor.listen(port, "127.0.0.1", () => {
+            // The real bridge records its key only after binding, behind ACL
+            // checks that take a moment.
+            setTimeout(() => writeBridgeState(port, newSecret, session), 600);
+          });
+        });
+        return new EventEmitter() as unknown as SpawnedBridge;
+      });
+
+      expect(resolvedPort).toBe(port);
+      await oldExit;
+      expect(
+        JSON.parse(readFileSync(resolveSessionPidFile(session), "utf8"))
+          .secret === newSecret,
+      ).toBe(true);
+    } finally {
+      windowsAcl.isWindowsBridgeProcess.mockReset();
+      windowsAcl.isWindowsBridgeProcess.mockReturnValue(false);
+      if (oldBridge.exitCode === null) oldBridge.kill("SIGKILL");
+      successor.closeAllConnections();
+      await new Promise<void>((r) => successor.close(() => r()));
+    }
+  }, 20_000);
+
+  it("reopens a page after forced termination and slow state verification", async () => {
+    // The server must keep running while synchronous Windows ACL checks block
+    // the client, just as the detached bridge does in normal CLI operation.
+    const startBridge = () =>
+      spawn(
+        process.execPath,
+        [
+          "--import",
+          "tsx",
+          "--input-type=module",
+          "-e",
+          `
+          import { createBridgeServer } from './src/bridge.ts';
+          import { createBridgeAuth } from './src/bridge-auth.ts';
+          const server = createBridgeServer({
+            listTools: async () => ({ tools: [] }),
+            callTool: async ({ name, arguments: args }) => ({
+              content: [{ type: 'text', text: name === 'new_page'
+                ? '## Pages\\n2: ' + args.url + ' [selected]'
+                : '## Pages\\n1: about:blank [selected]' }],
+            }),
+            close: async () => {},
+          }, 'early-exit-worker', undefined, createBridgeAuth('a'.repeat(64)));
+          server.listen(Number(process.env.CHROME_DEVTOOLS_AXI_PORT ?? 0), '127.0.0.1', () => {
+            console.log(server.address().port);
+          });
+          `,
+        ],
+        { stdio: ["ignore", "pipe", "inherit"], windowsHide: true },
+      );
+    const original = startBridge();
+    const originalExited = once(original, "exit");
+    let replacement: ReturnType<typeof startBridge> | undefined;
+    let replacementExited: Promise<unknown> | undefined;
+    const platform = vi.spyOn(process, "platform", "get");
+    try {
+      const [output] = await once(original.stdout, "data");
+      const port = Number(String(output).trim());
+      if (!original.pid) throw new Error("Bridge fixture did not start");
+      platform.mockReturnValue("win32");
+      writeBridgeState(port, AUTH_SECRET, "early-exit-worker", original.pid);
+      setSelectedPageId(7);
+      original.kill("SIGKILL");
+      await originalExited;
+      process.env.CHROME_DEVTOOLS_AXI_PORT = String(port);
+
+      await expect(
+        ensureBridge(() => {
+          replacement = startBridge();
+          replacementExited = once(replacement, "exit");
+          const pid = replacement.pid;
+          if (!pid) throw new Error("Replacement bridge did not start");
+          replacement.stdout.once("data", () => {
+            writeBridgeState(port, AUTH_SECRET, "early-exit-worker", pid);
+          });
+          return replacement;
+        }),
+      ).resolves.toBe(port);
+      await expect(callTool("take_snapshot")).rejects.toMatchObject({
+        code: "BROWSER_ERROR",
+        message: "No page is currently selected",
+      });
+      windowsAcl.verifyWindowsState
+        .mockImplementationOnce(() => {})
+        .mockImplementationOnce(() => {
+          Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 7_000);
+        });
+
+      await expect(
+        callTool("new_page", { url: "https://example.com/after-crash" }),
+      ).resolves.toBe(
+        "## Pages\n2: https://example.com/after-crash [selected]",
+      );
+      await expect(
+        checkBridgeHealth(port, { secret: AUTH_SECRET, deep: true }),
+      ).resolves.toBe(true);
+    } finally {
+      windowsAcl.verifyWindowsState.mockReset();
+      platform.mockRestore();
+      original.kill("SIGKILL");
+      replacement?.kill("SIGKILL");
+      await Promise.all([originalExited, replacementExited]);
+    }
+  }, 20_000);
+
+  it("surfaces unsafe session state instead of waiting out the startup deadline", async () => {
+    const session = "early-exit-worker";
+    const started = Date.now();
+
+    try {
+      await expect(
+        ensureBridge(() => {
+          writeBridgeState(9224, AUTH_SECRET, session);
+          if (process.platform === "win32") {
+            windowsAcl.verifyWindowsState.mockImplementation(() => {
+              throw new Error("Windows bridge ACL verification failed");
+            });
+          } else {
+            chmodSync(resolveSessionPidFile(session), 0o644);
+          }
+          return new EventEmitter() as unknown as SpawnedBridge;
+        }),
+      ).rejects.toThrow(/ACL|Unsafe/);
+      expect(Date.now() - started).toBeLessThan(5_000);
+    } finally {
+      windowsAcl.verifyWindowsState.mockReset();
+    }
+  }, 25_000);
+
+  it.runIf(process.platform === "win32").each([
+    { action: "restart", should_disappear: true },
+    { action: "stop", should_disappear: true },
+    { action: "restart", should_disappear: false },
+    { action: "stop", should_disappear: false },
+  ])(
+    "handles concurrent cleanup during $action verification only for missing state ($should_disappear)",
+    async ({ action, should_disappear }) => {
+      const session = "early-exit-worker";
+      const listener = createServer((request, response) => {
+        signFakeResponse(request, response);
+        response.end(JSON.stringify({ status: "ok", session }));
+      });
+      await new Promise<void>((ready) =>
+        listener.listen(0, "127.0.0.1", ready),
+      );
+      const port = (listener.address() as AddressInfo).port;
+      process.env.CHROME_DEVTOOLS_AXI_PORT = String(port);
+      writeBridgeState(port, AUTH_SECRET, session);
+      const stateFile = resolveSessionPidFile(session);
+      const state = readFileSync(stateFile, "utf8");
+      const failure = new Error("Windows bridge ACL verification failed");
+      windowsAcl.verifyWindowsState.mockImplementationOnce(() => {
+        if (should_disappear) unlinkSync(stateFile);
+        throw failure;
+      });
+      const start = vi.fn(() => {
+        writeBridgeState(port, AUTH_SECRET, session);
+        return new EventEmitter();
+      });
+
+      try {
+        const operation =
+          action === "restart" ? ensureBridge(start) : stopBridge();
+        if (!should_disappear) {
+          await expect(operation).rejects.toBe(failure);
+          expect(readFileSync(stateFile, "utf8")).toBe(state);
+          expect(start).not.toHaveBeenCalled();
+        } else if (action === "restart") {
+          await expect(operation).resolves.toBe(port);
+          expect(start).toHaveBeenCalledOnce();
+          expect(JSON.parse(readFileSync(stateFile, "utf8")).port).toBe(port);
+        } else {
+          await expect(operation).resolves.toBe(false);
+          expect(existsSync(stateFile)).toBe(false);
+        }
+      } finally {
+        windowsAcl.verifyWindowsState.mockReset();
+        listener.closeAllConnections();
+        await new Promise<void>((closed) => listener.close(() => closed()));
+      }
+    },
+  );
+
+  it.runIf(process.platform === "win32").each(["restart", "stop"])(
+    "preserves state when %s cannot verify the recorded process",
+    async (action) => {
+      const listener = createServer((_request, response) =>
+        response.end("unsigned"),
+      );
+      await new Promise<void>((ready) =>
+        listener.listen(0, "127.0.0.1", ready),
+      );
+      const port = (listener.address() as AddressInfo).port;
+      writeBridgeState(port, AUTH_SECRET, "early-exit-worker");
+      const stateFile = resolveSessionPidFile("early-exit-worker");
+      const state = readFileSync(stateFile, "utf8");
+      const start = vi.fn();
+      windowsAcl.isWindowsBridgeProcess.mockImplementation(() => {
+        throw new Error("Process ownership verification failed");
+      });
+      try {
+        await expect(
+          action === "restart" ? ensureBridge(start) : stopBridge(),
+        ).rejects.toThrow(/ownership verification failed/);
+        expect(readFileSync(stateFile, "utf8")).toBe(state);
+        expect(start).not.toHaveBeenCalled();
+      } finally {
+        windowsAcl.isWindowsBridgeProcess.mockReset();
+        windowsAcl.isWindowsBridgeProcess.mockReturnValue(false);
+        listener.closeAllConnections();
+        await new Promise<void>((closed) => listener.close(() => closed()));
+      }
+    },
+  );
+
+  it.runIf(process.platform === "win32").each([
+    { action: "restart", has_exited: true },
+    { action: "stop", has_exited: true },
+    { action: "restart", has_exited: false },
+    { action: "stop", has_exited: false },
+  ])(
+    "handles a taskkill failure during $action only if the process exited ($has_exited)",
+    async ({ action, has_exited }) => {
+      const childProcess =
+        await vi.importActual<typeof import("node:child_process")>(
+          "node:child_process",
+        );
+      const child = spawn(
+        process.execPath,
+        ["-e", "setInterval(() => {}, 1000)"],
+        {
+          stdio: "ignore",
+          windowsHide: true,
+        },
+      );
+      await new Promise((started) => child.once("spawn", started));
+      const exited = new Promise((done) => child.once("exit", done));
+      const pid = child.pid!;
+      const session = "early-exit-worker";
+      let is_replacement = false;
+      const listener = createServer((request, response) => {
+        signFakeResponse(request, response);
+        response.statusCode = is_replacement ? 200 : 503;
+        response.end(
+          JSON.stringify({ status: is_replacement ? "ok" : "error", session }),
+        );
+      });
+      await new Promise<void>((ready) =>
+        listener.listen(0, "127.0.0.1", ready),
+      );
+      const port = (listener.address() as AddressInfo).port;
+      process.env.CHROME_DEVTOOLS_AXI_PORT = String(port);
+      writeBridgeState(port, AUTH_SECRET, session, pid);
+      const stateFile = resolveSessionPidFile(session);
+      const state = readFileSync(stateFile, "utf8");
+      const start = vi.fn(() => {
+        is_replacement = true;
+        writeBridgeState(port, AUTH_SECRET, session);
+        return new EventEmitter();
+      });
+      windowsAcl.isWindowsBridgeProcess.mockImplementation(
+        (recordedPid) => recordedPid === pid,
+      );
+      const failure = new Error("taskkill failed");
+      vi.mocked(execFileSync).mockImplementationOnce((file, args, options) => {
+        if (!Array.isArray(args))
+          throw new Error("Expected taskkill arguments");
+        if (has_exited) childProcess.execFileSync(file, args, options);
+        throw failure;
+      });
+
+      try {
+        const operation =
+          action === "restart" ? ensureBridge(start) : stopBridge();
+        if (has_exited) {
+          await expect(operation).resolves.toBe(
+            action === "restart" ? port : true,
+          );
+          await exited;
+          expect(() => process.kill(pid, 0)).toThrow();
+          if (action === "restart") {
+            expect(JSON.parse(readFileSync(stateFile, "utf8")).pid).toBe(
+              process.pid,
+            );
+            expect(start).toHaveBeenCalledOnce();
+          } else {
+            expect(existsSync(stateFile)).toBe(false);
+          }
+        } else {
+          await expect(operation).rejects.toBe(failure);
+          expect(() => process.kill(pid, 0)).not.toThrow();
+          expect(readFileSync(stateFile, "utf8")).toBe(state);
+          expect(start).not.toHaveBeenCalled();
+        }
+      } finally {
+        vi.mocked(execFileSync).mockRestore();
+        windowsAcl.isWindowsBridgeProcess.mockReset();
+        windowsAcl.isWindowsBridgeProcess.mockReturnValue(false);
+        if (child.exitCode === null) child.kill("SIGKILL");
+        await exited;
+        listener.closeAllConnections();
+        await new Promise<void>((closed) => listener.close(() => closed()));
+      }
+    },
+    10_000,
+  );
+
   it("reuses a healthy same-session bridge that won the bind race instead of failing on the loser's early exit", async () => {
     // A concurrent same-session bridge owns the port and reports healthy only on
     // the *second* deep probe, so the loser's first in-loop check fails and the
     // pre-throw final deep check is what catches the winner.
     let deepProbes = 0;
     const winner = createServer((req, res) => {
+      signFakeResponse(req, res);
       if (req.method === "GET" && req.url?.startsWith("/health")) {
         const wantsDeep = req.url.includes("deep=1");
         if (wantsDeep) deepProbes++;
@@ -506,6 +1235,7 @@ describe("ensureBridge early-exit fast-fail", () => {
 
     try {
       const port = await ensureBridge(() => {
+        writeBridgeState(winnerPort, AUTH_SECRET, "early-exit-worker");
         const loser = new EventEmitter();
         setImmediate(() =>
           loser.emit("exit", BRIDGE_PORT_IN_USE_EXIT_CODE, null),
@@ -524,6 +1254,7 @@ describe("waitForProcessExit", () => {
   it("returns true once the process is gone", async () => {
     const child = spawn(process.execPath, ["-e", "setTimeout(() => {}, 200)"], {
       stdio: "ignore",
+      windowsHide: true,
     });
     expect(child.pid).toBeDefined();
     const pid = child.pid as number;
@@ -542,6 +1273,7 @@ describe("waitForProcessExit", () => {
       ["-e", "setTimeout(() => {}, 5000)"],
       {
         stdio: "ignore",
+        windowsHide: true,
       },
     );
     const pid = child.pid as number;
@@ -594,7 +1326,7 @@ describe("terminateBridgeProcess", () => {
         "-e",
         "process.on('SIGTERM', () => process.exit(0)); setTimeout(() => {}, 30000);",
       ],
-      { stdio: "ignore", detached: true },
+      { stdio: "ignore", windowsHide: true, detached: true },
     );
     const pid = child.pid as number;
     child.unref();
@@ -619,7 +1351,7 @@ describe("terminateBridgeProcess", () => {
     const child = spawn(
       process.execPath,
       ["-e", "process.on('SIGTERM', () => {}); setTimeout(() => {}, 30000);"],
-      { stdio: "ignore", detached: true },
+      { stdio: "ignore", windowsHide: true, detached: true },
     );
     const pid = child.pid as number;
     child.unref();
@@ -638,7 +1370,10 @@ describe("terminateBridgeProcess", () => {
 
   it("is a no-op when the pid is already gone", async () => {
     // Pick a likely-unused pid by spawning + waiting for it to exit.
-    const child = spawn(process.execPath, ["-e", ""], { stdio: "ignore" });
+    const child = spawn(process.execPath, ["-e", ""], {
+      stdio: "ignore",
+      windowsHide: true,
+    });
     const pid = child.pid as number;
     await new Promise<void>((r) => child.on("exit", () => r()));
 
@@ -654,13 +1389,13 @@ describe("terminateBridgeProcess", () => {
         "-e",
         [
           "const { spawn } = require('node:child_process');",
-          "const child = spawn(process.execPath, ['-e', 'setTimeout(() => {}, 30000)'], { stdio: 'ignore' });",
+          "const child = spawn(process.execPath, ['-e', 'setTimeout(() => {}, 30000)'], { stdio: 'ignore', windowsHide: true });",
           `require('node:fs').writeFileSync(${JSON.stringify(childPidFile)}, String(child.pid));`,
           "process.on('SIGTERM', () => {});",
           "setTimeout(() => {}, 30000);",
         ].join(""),
       ],
-      { stdio: "ignore", detached: true },
+      { stdio: "ignore", windowsHide: true, detached: true },
     );
     const parentPid = parent.pid as number;
     parent.unref();
@@ -709,6 +1444,7 @@ function startFakeCallBridge(opts: FakeCallBridgeOptions): Promise<{
     const roots: (string[] | undefined)[] = [];
     const requests: string[] = [];
     const server = createServer((req, res) => {
+      signFakeResponse(req, res);
       const ambient = req.headers[AMBIENT_REQUEST_HEADER] === "1";
       requests.push(`${req.method} ${req.url}${ambient ? " ambient" : ""}`);
       if (req.method === "GET" && req.url?.startsWith("/health")) {
@@ -772,6 +1508,7 @@ function startFakeCallBridge(opts: FakeCallBridgeOptions): Promise<{
 describe("callTool pageId routing", () => {
   const savedSession = process.env.CHROME_DEVTOOLS_AXI_SESSION;
   const savedHome = process.env.HOME;
+  const savedUserProfile = process.env.USERPROFILE;
   const savedPort = process.env.CHROME_DEVTOOLS_AXI_PORT;
   let tmpHome = "";
 
@@ -788,18 +1525,14 @@ describe("callTool pageId routing", () => {
   ): Promise<void> {
     tmpHome = mkdtempSync(join(tmpdir(), "axi-pageid-"));
     process.env.HOME = tmpHome;
+    process.env.USERPROFILE = tmpHome;
     process.env.CHROME_DEVTOOLS_AXI_SESSION = "pageid-worker";
     const fake = await startFakeCallBridge({
       session: "pageid-worker",
       ...opts,
     });
     process.env.CHROME_DEVTOOLS_AXI_PORT = String(fake.port);
-    const pidFile = resolveSessionPidFile("pageid-worker");
-    mkdirSync(dirname(pidFile), { recursive: true });
-    writeFileSync(
-      pidFile,
-      JSON.stringify({ pid: process.pid, port: fake.port }),
-    );
+    writeBridgeState(fake.port, AUTH_SECRET, "pageid-worker");
     try {
       await run(fake);
     } finally {
@@ -810,6 +1543,7 @@ describe("callTool pageId routing", () => {
   afterEach(() => {
     restore("CHROME_DEVTOOLS_AXI_SESSION", savedSession);
     restore("HOME", savedHome);
+    restore("USERPROFILE", savedUserProfile);
     restore("CHROME_DEVTOOLS_AXI_PORT", savedPort);
     if (tmpHome) rmSync(tmpHome, { recursive: true, force: true });
   });
@@ -1343,6 +2077,7 @@ describe("reconnect reporting through the deep health probe", () => {
 
   const savedSession = process.env.CHROME_DEVTOOLS_AXI_SESSION;
   const savedHome = process.env.HOME;
+  const savedUserProfile = process.env.USERPROFILE;
   const savedPort = process.env.CHROME_DEVTOOLS_AXI_PORT;
   let tmpHome = "";
 
@@ -1367,6 +2102,7 @@ describe("reconnect reporting through the deep health probe", () => {
   ): Promise<void> {
     tmpHome = mkdtempSync(join(tmpdir(), "axi-reconnect-cli-"));
     process.env.HOME = tmpHome;
+    process.env.USERPROFILE = tmpHome;
     process.env.CHROME_DEVTOOLS_AXI_SESSION = "reconnect-cli";
     let mcpCalls = 0;
     const client: BridgeClient = {
@@ -1387,16 +2123,19 @@ describe("reconnect reporting through the deep health probe", () => {
       },
       close: async () => {},
     };
-    const server = createBridgeServer(client, "reconnect-cli");
+    const server = createBridgeServer(
+      client,
+      "reconnect-cli",
+      undefined,
+      createBridgeAuth(AUTH_SECRET),
+    );
     try {
       await new Promise<void>((ready) => {
         server.listen(0, "127.0.0.1", ready);
       });
       const { port } = server.address() as AddressInfo;
       process.env.CHROME_DEVTOOLS_AXI_PORT = String(port);
-      const pidFile = resolveSessionPidFile("reconnect-cli");
-      mkdirSync(dirname(pidFile), { recursive: true });
-      writeFileSync(pidFile, JSON.stringify({ pid: process.pid, port }));
+      writeBridgeState(port, AUTH_SECRET, "reconnect-cli");
       await run();
     } finally {
       await new Promise<void>((closed) => server.close(() => closed()));
@@ -1406,6 +2145,7 @@ describe("reconnect reporting through the deep health probe", () => {
   afterEach(() => {
     restore("CHROME_DEVTOOLS_AXI_SESSION", savedSession);
     restore("HOME", savedHome);
+    restore("USERPROFILE", savedUserProfile);
     restore("CHROME_DEVTOOLS_AXI_PORT", savedPort);
     if (tmpHome) rmSync(tmpHome, { recursive: true, force: true });
   });

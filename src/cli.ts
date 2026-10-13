@@ -24,6 +24,7 @@ import { parsePagesList } from "./pages.js";
 import { overlaySessionSelected } from "./selected-page.js";
 import { resolveOutputPath } from "./paths.js";
 import { VERSION } from "./version.js";
+import { BRIDGE_TRANSPORT } from "./bridge-auth.js";
 import {
   captureFreshSnapshot,
   parseUidFresh as parseUidFreshShared,
@@ -44,7 +45,7 @@ export type MainOptions = {
 };
 
 export const TOP_HELP = `usage: chrome-devtools-axi [command] [args] [flags]
-commands[35]:
+commands[36]:
   open <url>, snapshot, screenshot <path>, click @<uid>, fill @<uid> <text>,
   type <text>, press <key>, scroll <dir>, back, wait <ms|text>, eval <js>,
   run,
@@ -52,7 +53,7 @@ commands[35]:
   upload @<uid> <path>, pages, newpage <url>, selectpage <id>, closepage <id>,
   resize <w> <h>, emulate, console, console-get <id>, network,
   network-get [id], lighthouse, perf-start, perf-stop,
-  perf-insight <set> <name>, heap <path>, start, stop, setup hooks
+  perf-insight <set> <name>, heap <path>, start, stop, security --json, setup hooks
 
 flags[2]:
   --help, -v/-V/--version
@@ -128,6 +129,12 @@ tips:
 `;
 
 const COMMAND_HELP: Record<string, string> = {
+  security: `usage: chrome-devtools-axi security --json
+Print the installed transport capability without starting a bridge or browser.
+
+flags:
+  --json  Emit one JSON object with version, platform and bridge_transport`,
+
   open: `usage: chrome-devtools-axi open <url> [--full]
 Navigate to a URL and capture an accessibility snapshot.
 
@@ -894,7 +901,7 @@ function trimSingleTrailingNewline(text: string): string {
 }
 
 function wrapsRawStdout(argv: string[] | undefined): boolean {
-  return (argv ?? process.argv.slice(2))[0] === "run";
+  return ["run", "security"].includes((argv ?? process.argv.slice(2))[0]);
 }
 
 function wrapStdout(
@@ -1707,6 +1714,18 @@ function validateCommandFlags(
 }
 
 const COMMAND_HANDLERS: Record<string, CommandFn> = {
+  security: async (args) => {
+    if (args.length !== 1 || args[0] !== "--json")
+      throw new Error("usage: chrome-devtools-axi security --json");
+    return (
+      RAW_STDOUT_MARKER +
+      JSON.stringify({
+        version: VERSION,
+        platform: process.platform,
+        bridge_transport: BRIDGE_TRANSPORT,
+      })
+    );
+  },
   open: withFullFlag(handleOpen),
   snapshot: async (args) => handleSnapshot(splitFullFlag(args).full),
   screenshot: withoutFullFlag(handleScreenshot),
@@ -1745,6 +1764,7 @@ const COMMAND_HANDLERS: Record<string, CommandFn> = {
 };
 
 const COMMAND_FLAGS: Record<string, readonly string[]> = {
+  security: ["--json"],
   open: ["--full"],
   screenshot: ["--uid", "--full-page", "--format"],
   snapshot: ["--full"],

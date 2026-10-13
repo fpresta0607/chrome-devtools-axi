@@ -155,7 +155,13 @@ In URL-only shared mode, the bridge uses Streamable HTTP directly instead:
 ```
 
 - **Persistent bridge** — a detached process keeps the selected MCP session alive across commands, so Chrome doesn't restart every invocation
-- **Auto-lifecycle** — the bridge starts on first command, writes a PID file to `~/.chrome-devtools-axi/bridge.pid`, and is reused only after a deep health check (`/health?deep=1`, one CDP `list_pages`). A bridge whose browser has died is terminated and respawned. Startup waits until `CHROME_DEVTOOLS_AXI_BRIDGE_TIMEOUT_MS` (default 30s). On stop, the bridge kills its process group; teardown escalates SIGTERM to SIGKILL, and only when `ps` confirms that PID is a bridge, so stdio-launched chrome-devtools-mcp and Chrome children are reaped. A bridge also shuts itself down when its stdio chrome-devtools-mcp process exits, since it can serve nothing without it. Otherwise it runs until `stop` unless you opt into an [idle timeout](#idle-timeout).
+- **Auto-lifecycle** - the bridge starts on the first browser command and is reused only after a deep health check (`/health?deep=1`, one CDP `list_pages`).
+  A bridge whose browser has died is terminated and respawned.
+  Startup waits until `CHROME_DEVTOOLS_AXI_BRIDGE_TIMEOUT_MS` (default 30s).
+  Stopping a bridge also terminates its AXI-owned MCP and Chrome children.
+  See [Bridge security](#bridge-security) for state protection and process verification requirements.
+  A bridge also shuts itself down when its stdio chrome-devtools-mcp process exits, since it can serve nothing without it.
+  Otherwise it runs until `stop` unless you opt into an [idle timeout](#idle-timeout).
 - **Snapshot parsing** — accessibility tree snapshots are extracted and analyzed for interactive elements (`uid=` refs)
 - **TOON encoding** — structured metadata uses [TOON format](https://www.npmjs.com/package/@toon-format/toon) for compact, token-efficient output
 
@@ -240,11 +246,12 @@ For large request or response bodies, prefer `network-get <id> --response-file <
 
 ### Bridge
 
-| Command       | Description                   |
-| ------------- | ----------------------------- |
-| `start`       | Start the bridge server       |
-| `stop`        | Stop the bridge server        |
-| `setup hooks` | Install or repair agent hooks |
+| Command           | Description                                             |
+| ----------------- | ------------------------------------------------------- |
+| `start`           | Start the bridge server                                 |
+| `stop`            | Stop the bridge server                                  |
+| `security --json` | Show the [bridge security capability](#bridge-security) |
+| `setup hooks`     | Install or repair agent hooks                           |
 
 ### Maintenance
 
@@ -438,10 +445,40 @@ Rely on the per-session default ports instead, or set `CHROME_DEVTOOLS_AXI_PORT`
 
 State is stored in `~/.chrome-devtools-axi/` (named sessions nest under `sessions/<name>/`):
 
-| File                  | Purpose                               |
-| --------------------- | ------------------------------------- |
-| `bridge.pid`          | PID and port of the running bridge    |
-| `snapshot-generation` | Counter used to detect stale uid refs |
+| File                  | Purpose                                         |
+| --------------------- | ----------------------------------------------- |
+| `bridge.pid`          | PID, port and private bridge authentication key |
+| `snapshot-generation` | Counter used to detect stale uid refs           |
+
+### Bridge security
+
+`chrome-devtools-axi security --json` is an offline capability probe that prints exactly one JSON object with `version`, `platform` and `bridge_transport`.
+It starts no bridge, browser or login.
+On `win32`, `bridge_transport` is `windows-user-v1`, and on POSIX platforms it is `user-v1`.
+Clients must check this capability rather than infer it from `version`.
+
+Every local bridge route requires per-request HMAC-SHA256 authentication in default and named sessions, including shallow and deep health, tool discovery and tool calls.
+Each bridge start creates a fresh random 256-bit key.
+The CLI authenticates transparently with no unauthenticated fallback and verifies that each response is signed for its request before trusting it.
+Requests bind the method, exact path, exact body bytes, timestamp, ambient activity header and fresh nonce, with replay rejection and separate request and response MAC domains.
+Bridge request bodies are limited to 16 MiB and CLI response bodies to 64 MiB.
+
+The key never travels over HTTP and is stored only in the session's protected `bridge.pid` file.
+Windows state directories and key files use owner-only ACLs, checked for current-user ownership and access before the first key write and on every read.
+POSIX state directories are prepared with mode `0700` and key files with mode `0600`, with ownership and permission checks before writing or reading a key.
+This boundary protects against other non-admin Windows users on the same machine.
+SYSTEM and administrators remain outside this boundary, as do hostile processes running as the same user.
+Host and Origin checks remain in place.
+This secures the local AXI bridge, while the attached browser and any remote MCP endpoint require their own access controls.
+
+Legacy bridges cannot be reused.
+After upgrading, explicitly run `chrome-devtools-axi stop`, then `chrome-devtools-axi start` for each session.
+`stop` verifies ownership and rejects linked legacy state before tightening its permissions and reading the record.
+Stopping or replacing a live bridge requires protected state and PID verification.
+On Windows, the PID must belong to the current user's AXI bridge listening on the recorded loopback port.
+A recorded PID that now belongs to another process is treated as a stale record and cleared without terminating that process.
+State with unsafe ownership or links, or a process whose ownership cannot be checked, fails closed.
+Never share or print `bridge.pid` because it contains the session key.
 
 ### Idle timeout
 
@@ -452,7 +489,7 @@ To have bridges clean up after sessions that never run `stop`, opt into an idle 
 export CHROME_DEVTOOLS_AXI_IDLE_TIMEOUT_MS=1800000   # 30 minutes
 ```
 
-A bridge started with it set shuts itself down, together with the chrome-devtools-mcp process and any browser it launched, once that long passes with no command and no request in flight.
+A bridge started with it set shuts itself down, together with the chrome-devtools-mcp process and any browser it launched, once that long passes with no command and no authenticated request in flight.
 Every command that talks to the browser counts as activity except the home view: bare `chrome-devtools-axi`, which is also the page summary `setup hooks` shows at agent session start, does not renew the timeout, so starting new agent sessions does not keep an abandoned bridge alive.
 The next command after a shutdown starts a fresh bridge, so pages and state of a browser this tool launched are lost, as after `stop`.
 Unset, blank, or `0` keeps the default; values below `1000` are raised to `1000`, and a value that is not a whole number of milliseconds is ignored.
