@@ -460,8 +460,9 @@ This secures the local AXI bridge, while the attached browser and any remote MCP
 
 Legacy bridges cannot be reused.
 After upgrading, explicitly run `chrome-devtools-axi stop`, then `chrome-devtools-axi start` for each session.
-Stopping legacy state requires safe state ACLs and verification that the PID belongs to the current user's AXI bridge.
-Unsafe state or an unverified process fails closed without terminating that process.
+Stopping or replacing a bridge requires safe state ACLs and verification that the PID is the current user's AXI bridge, which on Windows must also be listening on the recorded port.
+A recorded PID that now belongs to another process is treated as a stale record and cleared without terminating that process.
+Unsafe state, or a process whose ownership cannot be checked, fails closed.
 Never share or print `bridge.pid` because it contains the session key.
 
 ### Idle timeout

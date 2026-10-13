@@ -24,6 +24,10 @@ vi.mock("../src/windows-acl.js", () => ({
   secureWindowsPath,
   secureWindowsPaths: (paths: string[], mode: string) =>
     paths.forEach((path) => secureWindowsPath(path, mode)),
+  verifyWindowsState: (directories: string[], file: string) => {
+    directories.forEach((path) => secureWindowsPath(path, "verify-directory"));
+    secureWindowsPath(file, "verify-file");
+  },
 }));
 
 import {

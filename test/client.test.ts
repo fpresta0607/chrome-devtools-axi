@@ -9,6 +9,7 @@ import {
 } from "node:http";
 import { AddressInfo } from "node:net";
 import {
+  chmodSync,
   mkdtempSync,
   mkdirSync,
   readFileSync,
@@ -16,7 +17,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { AxiError } from "axi-sdk-js";
 import {
   BRIDGE_PORT_IN_USE_EXIT_CODE,
@@ -28,6 +29,10 @@ import { AMBIENT_REQUEST_HEADER } from "../src/bridge-script.js";
 import { createBridgeAuth, RESPONSE_PROOF_HEADER } from "../src/bridge-auth.js";
 import { writeBridgeState } from "../src/bridge-state.js";
 
+const windowsAcl = vi.hoisted(() => ({
+  isWindowsBridgeProcess: vi.fn((_pid: number, _port: number) => false),
+  verifyWindowsState: vi.fn(),
+}));
 vi.mock("../src/windows-acl.js", () => ({
   secureWindowsPaths: (paths: string[], mode: string) => {
     if (mode === "prepare-directory")
@@ -36,9 +41,8 @@ vi.mock("../src/windows-acl.js", () => ({
   secureWindowsPath: (path: string, mode: string) => {
     if (mode === "prepare-directory") mkdirSync(path, { recursive: true });
   },
-  verifyWindowsBridgeProcess: () => {
-    throw new Error("Unverified test PID");
-  },
+  verifyWindowsState: windowsAcl.verifyWindowsState,
+  isWindowsBridgeProcess: windowsAcl.isWindowsBridgeProcess,
 }));
 
 const AUTH_SECRET = "a".repeat(64);
@@ -251,6 +255,78 @@ function startFakeBridgeServer(opts: FakeBridgeOptions): Promise<{
 }
 
 describe("checkBridgeHealth (deep probe)", () => {
+  it("rejects invalid UTF-8 response bytes even when their replacement text has a valid proof", async () => {
+    const server = createServer((req, res) => {
+      const body = JSON.stringify({ status: "ok", message: "\ufffd" });
+      const wireBody = Buffer.from(body.replace("\ufffd", "x"));
+      wireBody[wireBody.indexOf("x")] = 0xff;
+      res.setHeader(
+        RESPONSE_PROOF_HEADER,
+        RESPONSE_AUTH.signResponse(req.headers.authorization ?? "", 200, body),
+      );
+      res.end(wireBody);
+    });
+    await new Promise<void>((ready) => server.listen(0, "127.0.0.1", ready));
+    try {
+      const { port } = server.address() as AddressInfo;
+
+      await expect(
+        checkBridgeHealth(port, { secret: AUTH_SECRET }),
+      ).rejects.toThrow("Bridge authentication failed");
+    } finally {
+      await new Promise<void>((closed) => server.close(() => closed()));
+    }
+  });
+
+  it("gives up on a peer that trickles its response past the deadline", async () => {
+    const server = createServer((_req, res) => {
+      res.writeHead(200);
+      const timer = setInterval(() => res.write(" "), 100);
+      res.on("close", () => clearInterval(timer));
+    });
+    await new Promise<void>((ready) => server.listen(0, "127.0.0.1", ready));
+    try {
+      const { port } = server.address() as AddressInfo;
+      const started = Date.now();
+
+      await expect(
+        checkBridgeHealth(port, { secret: AUTH_SECRET }),
+      ).resolves.toBe(false);
+      expect(Date.now() - started).toBeLessThan(4_000);
+    } finally {
+      server.closeAllConnections();
+      await new Promise<void>((closed) => server.close(() => closed()));
+    }
+  }, 10_000);
+
+  it("stops buffering an unbounded response before verifying it", async () => {
+    const chunk = Buffer.alloc(1024 * 1024, 0x61);
+    let sent = 0;
+    const server = createServer((_req, res) => {
+      res.writeHead(200);
+      const pump = () => {
+        while (!res.destroyed) {
+          sent += chunk.length;
+          if (!res.write(chunk)) return;
+        }
+      };
+      res.on("drain", pump);
+      pump();
+    });
+    await new Promise<void>((ready) => server.listen(0, "127.0.0.1", ready));
+    try {
+      const { port } = server.address() as AddressInfo;
+
+      await expect(
+        checkBridgeHealth(port, { secret: AUTH_SECRET }),
+      ).resolves.toBe(false);
+      expect(sent).toBeLessThan(128 * 1024 * 1024);
+    } finally {
+      server.closeAllConnections();
+      await new Promise<void>((closed) => server.close(() => closed()));
+    }
+  }, 10_000);
+
   it("rejects unsigned health from a port squatter without exposing the state secret", async () => {
     let observedHeaders = "";
     const server = createServer((req, res) => {
@@ -558,6 +634,102 @@ describe("ensureBridge early-exit fast-fail", () => {
     expect(suggestions).not.toContain("hashed-port collision");
     expect(elapsed).toBeLessThan(5000);
   });
+
+  it("replaces a force-killed bridge without probing its successor with the stale key", async () => {
+    const session = "early-exit-worker";
+    const newSecret = "c".repeat(64);
+    const pages = {
+      content: [{ type: "text", text: "## Pages\n1: about:blank [selected]" }],
+    };
+    const deadBrowser = createBridgeServer(
+      {
+        listTools: async () => ({ tools: [] }),
+        callTool: async () => ({
+          isError: true,
+          content: [{ type: "text", text: "Target closed" }],
+        }),
+        close: async () => {},
+      },
+      session,
+      undefined,
+      createBridgeAuth(AUTH_SECRET),
+    );
+    await new Promise<void>((r) => deadBrowser.listen(0, "127.0.0.1", r));
+    const port = (deadBrowser.address() as AddressInfo).port;
+    process.env.CHROME_DEVTOOLS_AXI_PORT = String(port);
+    const oldBridge = spawn(
+      process.execPath,
+      [resolve("test/fixtures/legacy/chrome-devtools-axi-bridge.js")],
+      { stdio: "ignore", windowsHide: true },
+    );
+    await new Promise((started) => oldBridge.once("spawn", started));
+    const oldExit = new Promise((exited) => oldBridge.once("exit", exited));
+    writeBridgeState(port, AUTH_SECRET, session, oldBridge.pid as number);
+    windowsAcl.isWindowsBridgeProcess.mockImplementation(
+      (pid) => pid === oldBridge.pid,
+    );
+    const successor = createBridgeServer(
+      {
+        listTools: async () => ({ tools: [] }),
+        callTool: async () => pages,
+        close: async () => {},
+      },
+      session,
+      undefined,
+      createBridgeAuth(newSecret),
+    );
+
+    try {
+      const resolvedPort = await ensureBridge(() => {
+        deadBrowser.closeAllConnections();
+        deadBrowser.close(() => {
+          successor.listen(port, "127.0.0.1", () => {
+            // The real bridge records its key only after binding, behind ACL
+            // checks that take a moment.
+            setTimeout(() => writeBridgeState(port, newSecret, session), 600);
+          });
+        });
+        return new EventEmitter() as unknown as SpawnedBridge;
+      });
+
+      expect(resolvedPort).toBe(port);
+      await oldExit;
+      expect(
+        JSON.parse(readFileSync(resolveSessionPidFile(session), "utf8"))
+          .secret === newSecret,
+      ).toBe(true);
+    } finally {
+      windowsAcl.isWindowsBridgeProcess.mockReset();
+      windowsAcl.isWindowsBridgeProcess.mockReturnValue(false);
+      if (oldBridge.exitCode === null) oldBridge.kill("SIGKILL");
+      successor.closeAllConnections();
+      await new Promise<void>((r) => successor.close(() => r()));
+    }
+  }, 20_000);
+
+  it("surfaces unsafe session state instead of waiting out the startup deadline", async () => {
+    const session = "early-exit-worker";
+    const started = Date.now();
+
+    try {
+      await expect(
+        ensureBridge(() => {
+          writeBridgeState(9224, AUTH_SECRET, session);
+          if (process.platform === "win32") {
+            windowsAcl.verifyWindowsState.mockImplementation(() => {
+              throw new Error("Windows bridge ACL verification failed");
+            });
+          } else {
+            chmodSync(resolveSessionPidFile(session), 0o644);
+          }
+          return new EventEmitter() as unknown as SpawnedBridge;
+        }),
+      ).rejects.toThrow(/ACL|Unsafe/);
+      expect(Date.now() - started).toBeLessThan(5_000);
+    } finally {
+      windowsAcl.verifyWindowsState.mockReset();
+    }
+  }, 25_000);
 
   it("reuses a healthy same-session bridge that won the bind race instead of failing on the loser's early exit", async () => {
     // A concurrent same-session bridge owns the port and reports healthy only on

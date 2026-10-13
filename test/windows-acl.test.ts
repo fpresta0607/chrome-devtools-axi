@@ -1,11 +1,21 @@
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { execFileSync, spawn } from "node:child_process";
+import { once } from "node:events";
+import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { describe, expect, it } from "vitest";
 import {
+  isWindowsBridgeProcess,
   secureWindowsPath,
-  verifyWindowsBridgeProcess,
+  verifyWindowsState,
 } from "../src/windows-acl.js";
+
+function grant(path: string, sid: string): void {
+  execFileSync("icacls.exe", [path, "/grant", `*${sid}:(R)`], {
+    windowsHide: true,
+    stdio: "ignore",
+  });
+}
 
 describe.runIf(process.platform === "win32")("Windows ACL enforcement", () => {
   it("creates and revalidates owner-protected directories and inherited token ACLs", () => {
@@ -20,12 +30,82 @@ describe.runIf(process.platform === "win32")("Windows ACL enforcement", () => {
         secureWindowsPath(directory, "verify-directory"),
       ).not.toThrow();
       expect(() => secureWindowsPath(file, "verify-file")).not.toThrow();
-      expect(() => secureWindowsPath(home, "verify-directory")).toThrow(/ACL/);
-      expect(() => verifyWindowsBridgeProcess(process.pid)).toThrow(
-        /ownership/,
-      );
+      expect(() => verifyWindowsState([directory], file)).not.toThrow();
+      expect(() => verifyWindowsState([home], file)).toThrow(/ACL/);
+      expect(() => verifyWindowsState([directory], directory)).toThrow(/ACL/);
     } finally {
       rmSync(home, { recursive: true, force: true });
     }
   }, 20_000);
+
+  it.each([
+    ["Everyone", "S-1-1-0"],
+    ["Authenticated Users", "S-1-5-11"],
+    ["Users", "S-1-5-32-545"],
+    ["INTERACTIVE", "S-1-5-4"],
+  ])(
+    "rejects state readable by %s",
+    (_name, sid) => {
+      const home = mkdtempSync(join(tmpdir(), "axi-windows-acl-"));
+      const directory = join(home, "protected-state");
+      const file = join(directory, "token");
+      try {
+        secureWindowsPath(directory, "prepare-directory");
+        writeFileSync(file, "", { flag: "wx" });
+        expect(() => verifyWindowsState([directory], file)).not.toThrow();
+
+        grant(file, sid);
+        expect(() => verifyWindowsState([directory], file)).toThrow(/ACL/);
+        expect(() =>
+          secureWindowsPath(directory, "verify-directory"),
+        ).not.toThrow();
+
+        grant(directory, sid);
+        expect(() => secureWindowsPath(directory, "verify-directory")).toThrow(
+          /ACL/,
+        );
+      } finally {
+        rmSync(home, { recursive: true, force: true });
+      }
+    },
+    30_000,
+  );
+
+  it("protects a profile path with non-ASCII characters at its exact location", () => {
+    const home = mkdtempSync(join(tmpdir(), "axi-windows-acl-"));
+    const directory = join(home, "état-Grüße-用户");
+    try {
+      secureWindowsPath(directory, "prepare-directory");
+
+      expect(existsSync(directory)).toBe(true);
+      expect(() =>
+        secureWindowsPath(directory, "verify-directory"),
+      ).not.toThrow();
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
+  }, 20_000);
+
+  it("identifies only this user's bridge listening on its recorded port", async () => {
+    const bridge = spawn(
+      process.execPath,
+      [resolve("test/fixtures/legacy/chrome-devtools-axi-bridge.js")],
+      { stdio: ["ignore", "pipe", "ignore"], windowsHide: true },
+    );
+    const exited = once(bridge, "exit");
+    try {
+      const [line] = await once(bridge.stdout, "data");
+      const port = Number(String(line).trim());
+      if (!bridge.pid) throw new Error("Bridge fixture did not start");
+
+      expect(isWindowsBridgeProcess(bridge.pid, port)).toBe(true);
+      expect(
+        isWindowsBridgeProcess(bridge.pid, port === 1 ? 2 : port - 1),
+      ).toBe(false);
+      expect(isWindowsBridgeProcess(process.pid, port)).toBe(false);
+    } finally {
+      bridge.kill();
+      await exited;
+    }
+  }, 30_000);
 });

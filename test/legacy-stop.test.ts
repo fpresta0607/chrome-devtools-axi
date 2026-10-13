@@ -19,18 +19,19 @@ describe("legacy bridge migration", () => {
     const child = spawn(
       process.execPath,
       [resolve("test/fixtures/legacy/chrome-devtools-axi-bridge.js")],
-      { stdio: "ignore", windowsHide: true },
+      { stdio: ["ignore", "pipe", "ignore"], windowsHide: true },
     );
     const exited = once(child, "exit");
     try {
-      await once(child, "spawn");
+      const [line] = await once(child.stdout, "data");
+      const port = Number(String(line).trim());
       if (!child.pid) throw new Error("Legacy fixture did not start");
       process.env.HOME = home;
       process.env.USERPROFILE = home;
       process.env.CHROME_DEVTOOLS_AXI_SESSION = "legacy-test";
       prepareSessionState();
       const stateFile = resolveSessionPidFile();
-      writeFileSync(stateFile, JSON.stringify({ pid: child.pid, port: 9224 }), {
+      writeFileSync(stateFile, JSON.stringify({ pid: child.pid, port }), {
         mode: 0o600,
       });
       const start = vi.fn();

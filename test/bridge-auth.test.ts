@@ -3,6 +3,8 @@ import { request, type IncomingHttpHeaders } from "node:http";
 import type { AddressInfo } from "node:net";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { createBridgeServer, type BridgeClient } from "../src/bridge.js";
+import { createBridgeAuth } from "../src/bridge-auth.js";
+import { createIdleTracker } from "../src/idle.js";
 
 const SECRET = "a".repeat(64);
 
@@ -33,7 +35,7 @@ function send(
   port: number,
   path: string,
   headers: Record<string, string> = {},
-  body = "",
+  body: string | Buffer = "",
 ) {
   return new Promise<{
     status: number | undefined;
@@ -234,6 +236,93 @@ describe("bridge authentication boundary", () => {
     expect((await send(port, "/call", headers, body)).status).toBe(401);
 
     expect(client.callTool).toHaveBeenCalledTimes(1);
+  });
+
+  it("rejects invalid UTF-8 bytes instead of authenticating their replacement text", async () => {
+    const { client, port } = await startAuthenticatedServer();
+    const body = JSON.stringify({
+      name: "list_pages",
+      args: { value: "\ufffd" },
+    });
+    const wireBody = Buffer.from(body.replace("\ufffd", "x"));
+    wireBody[wireBody.indexOf("x")] = 0xff;
+
+    const response = await send(
+      port,
+      "/call",
+      requestHeaders("POST", "/call", body),
+      wireBody,
+    );
+
+    expect(response.status).toBe(400);
+    expect(client.callTool).not.toHaveBeenCalled();
+    expect(
+      (await send(port, "/call", requestHeaders("POST", "/call", body), body))
+        .status,
+    ).toBe(200);
+    expect(client.callTool).toHaveBeenCalledTimes(1);
+  });
+
+  it("stops reading an oversized body before authentication and keeps serving", async () => {
+    const { client, port } = await startAuthenticatedServer();
+    const oversized = Buffer.alloc(17 * 1024 * 1024, 0x61);
+
+    const outcome = await send(
+      port,
+      "/call",
+      { authorization: "AXI-HMAC forged" },
+      oversized,
+    ).then(
+      (response) => response.status,
+      (error: NodeJS.ErrnoException) => error.code,
+    );
+
+    expect(outcome === 401).toBe(false);
+    expect([400, "ECONNRESET", "EPIPE"]).toContain(outcome);
+    const body = JSON.stringify({ name: "list_pages", args: {} });
+    expect(
+      (await send(port, "/call", requestHeaders("POST", "/call", body), body))
+        .status,
+    ).toBe(200);
+    expect(client.callTool).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not let an unfinished unauthenticated request hold off idle shutdown", async () => {
+    const onIdle = vi.fn();
+    const server = createBridgeServer(
+      {
+        listTools: async () => ({ tools: [] }),
+        callTool: async () => ({ content: [] }),
+        close: async () => {},
+      },
+      "default",
+      createIdleTracker(300, onIdle),
+      createBridgeAuth(SECRET),
+    );
+    servers.push(server);
+    await new Promise<void>((resolve) =>
+      server.listen(0, "127.0.0.1", resolve),
+    );
+    const { port } = server.address() as AddressInfo;
+    const pending = request({
+      hostname: "127.0.0.1",
+      port,
+      path: "/call",
+      method: "POST",
+      headers: { authorization: "AXI-HMAC forged", "content-length": "1024" },
+    });
+    pending.on("error", () => {});
+    try {
+      pending.write("{");
+      const deadline = Date.now() + 3_000;
+      while (onIdle.mock.calls.length === 0 && Date.now() < deadline) {
+        await new Promise((settle) => setTimeout(settle, 50));
+      }
+
+      expect(onIdle).toHaveBeenCalledTimes(1);
+    } finally {
+      pending.destroy();
+    }
   });
 
   it("rejects tampered call bodies and route substitution", async () => {

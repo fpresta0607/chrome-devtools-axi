@@ -62,8 +62,8 @@ function withTimeout<T>(promise: Promise<T>, ms: number, what: string) {
 
 async function startBridge(
   extraEnv: Record<string, string> = {},
+  home = mkdtempSync(join(tmpdir(), "axi-bridge-lifecycle-")),
 ): Promise<RunningBridge> {
-  const home = mkdtempSync(join(tmpdir(), "axi-bridge-lifecycle-"));
   const mcpPidFile = join(home, "fake-mcp.pid");
   // Drop inherited AXI settings so a developer's own configuration (a shared
   // MCP URL, an idle timeout) cannot change which lifecycle is under test.
@@ -154,15 +154,11 @@ describe("bridge process lifecycle", () => {
       withTimeout(running.exited, 8_000, "idle bridge exit"),
     ).resolves.toBe(0);
     expect(existsSync(running.pidFile)).toBe(false);
-    await withTimeout(
-      (async () => {
-        while (isAlive(running.mcpPid)) {
-          await new Promise((settle) => setTimeout(settle, 50));
-        }
-      })(),
-      5_000,
-      "MCP server exit after idle shutdown",
-    );
+    const deadline = Date.now() + 5_000;
+    while (isAlive(running.mcpPid) && Date.now() < deadline) {
+      await new Promise((settle) => setTimeout(settle, 50));
+    }
+    expect(isAlive(running.mcpPid)).toBe(false);
   }, 30_000);
 
   it("shuts down when its MCP server ends", async () => {
@@ -174,5 +170,25 @@ describe("bridge process lifecycle", () => {
       withTimeout(running.exited, 8_000, "bridge exit after MCP server died"),
     ).resolves.toBe(0);
     expect(existsSync(running.pidFile)).toBe(false);
+  }, 30_000);
+
+  it("cleans up and rotates the authentication key when the same session restarts", async () => {
+    const original = await startBridge();
+    const originalSecret = JSON.parse(
+      readFileSync(original.pidFile, "utf8"),
+    ).secret;
+    process.kill(original.mcpPid, "SIGKILL");
+    await withTimeout(original.exited, 8_000, "original bridge exit");
+    expect(existsSync(original.pidFile)).toBe(false);
+
+    const restarted = await startBridge({}, original.home);
+    const restartedSecret = JSON.parse(
+      readFileSync(restarted.pidFile, "utf8"),
+    ).secret;
+
+    expect(typeof originalSecret).toBe("string");
+    expect(typeof restartedSecret).toBe("string");
+    expect(originalSecret === restartedSecret).toBe(false);
+    expect(restarted.child.exitCode).toBeNull();
   }, 30_000);
 });

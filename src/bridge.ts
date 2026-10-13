@@ -21,6 +21,7 @@ import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js"
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import { ListRootsRequestSchema } from "@modelcontextprotocol/sdk/types.js";
 import type { Transport } from "@modelcontextprotocol/sdk/shared/transport.js";
+import { isUtf8 } from "node:buffer";
 import { execFileSync, execSync } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import {
@@ -418,12 +419,26 @@ function parseRootsField(roots: unknown): string[] | undefined {
   return roots as string[];
 }
 
+const MAX_REQUEST_BODY_BYTES = 16 * 1024 * 1024;
+
 async function readRequestBody(req: IncomingMessage): Promise<string> {
   const chunks: Buffer[] = [];
+  let size = 0;
   for await (const chunk of req) {
-    chunks.push(typeof chunk === "string" ? Buffer.from(chunk) : chunk);
+    const buffer: Buffer =
+      typeof chunk === "string" ? Buffer.from(chunk) : chunk;
+    size += buffer.length;
+    // The body is read before its MAC can be checked, so an unauthenticated
+    // peer must not be able to make the bridge buffer without bound.
+    if (size > MAX_REQUEST_BODY_BYTES) {
+      req.destroy();
+      throw new Error("Invalid bridge request");
+    }
+    chunks.push(buffer);
   }
-  return Buffer.concat(chunks).toString("utf8");
+  const body = Buffer.concat(chunks);
+  if (!isUtf8(body)) throw new Error("Invalid bridge request");
+  return body.toString("utf8");
 }
 
 function writeJson(
@@ -613,10 +628,14 @@ export function createBridgeServer(
   auth?: BridgeAuth,
 ): Server {
   return createServer((req, res) => {
-    const end = idle?.begin();
-    let is_authenticated = false;
-    if (end)
-      res.once("close", () => end(is_authenticated && isIdleActivity(req)));
+    // Only an authenticated request is in flight for idle shutdown, so another
+    // user's unfinished request cannot keep an idle bridge alive.
+    let end: ((activity: boolean) => void) | undefined;
+    let is_closed = false;
+    res.once("close", () => {
+      is_closed = true;
+      end?.(isIdleActivity(req));
+    });
     void handleBridgeRequest(
       client,
       req,
@@ -626,7 +645,7 @@ export function createBridgeServer(
       clearSelectedPageId,
       auth,
       () => {
-        is_authenticated = true;
+        if (!is_closed) end = idle?.begin();
       },
     );
   });

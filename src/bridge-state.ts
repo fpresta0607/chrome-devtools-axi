@@ -20,7 +20,11 @@ import {
   resolveSessionStateDir,
   validateSessionName,
 } from "./sessions.js";
-import { secureWindowsPath, secureWindowsPaths } from "./windows-acl.js";
+import {
+  secureWindowsPath,
+  secureWindowsPaths,
+  verifyWindowsState,
+} from "./windows-acl.js";
 
 export interface BridgeState {
   pid: number;
@@ -76,11 +80,9 @@ function readState(sessionName: string): Record<string, unknown> | null {
     if (!existsSync(path)) return null;
     if (process.platform !== "win32") verifyPosixPath(path, true);
   }
-  if (process.platform === "win32")
-    secureWindowsPaths(directories, "verify-directory");
   const path = resolveSessionPidFile(sessionName);
   if (!existsSync(path)) return null;
-  if (process.platform === "win32") secureWindowsPath(path, "verify-file");
+  if (process.platform === "win32") verifyWindowsState(directories, path);
   else verifyPosixPath(path, false);
   try {
     const data: unknown = JSON.parse(readFileSync(path, "utf8"));

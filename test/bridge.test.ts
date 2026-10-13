@@ -2544,7 +2544,7 @@ describe("idle activity", () => {
     );
   });
 
-  it("tracks every served request from arrival until its response closes", async () => {
+  it("tracks only authenticated requests until their responses close", async () => {
     const client: BridgeClient = {
       listTools: async () => ({ tools: [] }),
       callTool: async () => ({ content: [{ type: "text", text: "ok" }] }),
@@ -2599,17 +2599,13 @@ describe("idle activity", () => {
         200,
       );
       expect(await send("/health", { host: "rebound.example" })).toBe(403);
+      expect(await send("/tools", { authorization: "AXI-HMAC forged" })).toBe(
+        401,
+      );
       // The response is sent before its "close" event; let that land.
       await new Promise((settle) => setImmediate(settle));
 
-      expect(events).toEqual([
-        "begin",
-        "end:true",
-        "begin",
-        "end:false",
-        "begin",
-        "end:false",
-      ]);
+      expect(events).toEqual(["begin", "end:true", "begin", "end:false"]);
     } finally {
       await new Promise<void>((closed) => {
         server.close(() => closed());
