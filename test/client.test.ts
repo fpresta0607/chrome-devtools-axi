@@ -15,6 +15,7 @@ import {
   mkdirSync,
   readFileSync,
   rmSync,
+  unlinkSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -939,6 +940,60 @@ describe("ensureBridge early-exit fast-fail", () => {
       windowsAcl.verifyWindowsState.mockReset();
     }
   }, 25_000);
+
+  it.runIf(process.platform === "win32").each([
+    { action: "restart", should_disappear: true },
+    { action: "stop", should_disappear: true },
+    { action: "restart", should_disappear: false },
+    { action: "stop", should_disappear: false },
+  ])(
+    "handles concurrent cleanup during $action verification only for missing state ($should_disappear)",
+    async ({ action, should_disappear }) => {
+      const session = "early-exit-worker";
+      const listener = createServer((request, response) => {
+        signFakeResponse(request, response);
+        response.end(JSON.stringify({ status: "ok", session }));
+      });
+      await new Promise<void>((ready) =>
+        listener.listen(0, "127.0.0.1", ready),
+      );
+      const port = (listener.address() as AddressInfo).port;
+      process.env.CHROME_DEVTOOLS_AXI_PORT = String(port);
+      writeBridgeState(port, AUTH_SECRET, session);
+      const stateFile = resolveSessionPidFile(session);
+      const state = readFileSync(stateFile, "utf8");
+      const failure = new Error("Windows bridge ACL verification failed");
+      windowsAcl.verifyWindowsState.mockImplementationOnce(() => {
+        if (should_disappear) unlinkSync(stateFile);
+        throw failure;
+      });
+      const start = vi.fn(() => {
+        writeBridgeState(port, AUTH_SECRET, session);
+        return new EventEmitter();
+      });
+
+      try {
+        const operation =
+          action === "restart" ? ensureBridge(start) : stopBridge();
+        if (!should_disappear) {
+          await expect(operation).rejects.toBe(failure);
+          expect(readFileSync(stateFile, "utf8")).toBe(state);
+          expect(start).not.toHaveBeenCalled();
+        } else if (action === "restart") {
+          await expect(operation).resolves.toBe(port);
+          expect(start).toHaveBeenCalledOnce();
+          expect(JSON.parse(readFileSync(stateFile, "utf8")).port).toBe(port);
+        } else {
+          await expect(operation).resolves.toBe(false);
+          expect(existsSync(stateFile)).toBe(false);
+        }
+      } finally {
+        windowsAcl.verifyWindowsState.mockReset();
+        listener.closeAllConnections();
+        await new Promise<void>((closed) => listener.close(() => closed()));
+      }
+    },
+  );
 
   it.runIf(process.platform === "win32").each(["restart", "stop"])(
     "preserves state when %s cannot verify the recorded process",

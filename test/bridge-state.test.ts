@@ -9,6 +9,7 @@ import {
   readdirSync,
   rmSync,
   symlinkSync,
+  unlinkSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -26,7 +27,13 @@ vi.mock("node:os", async (importOriginal) => ({
 }));
 vi.mock("node:fs", async (importOriginal) => {
   const filesystem = await importOriginal<typeof import("node:fs")>();
-  return { ...filesystem, mkdirSync: vi.fn(filesystem.mkdirSync) };
+  return {
+    ...filesystem,
+    lstatSync: vi.fn(filesystem.lstatSync),
+    mkdirSync: vi.fn(filesystem.mkdirSync),
+    readFileSync: vi.fn(filesystem.readFileSync),
+    unlinkSync: vi.fn(filesystem.unlinkSync),
+  };
 });
 vi.mock("../src/windows-acl.js", () => ({
   secureWindowsPath,
@@ -42,6 +49,7 @@ import {
   prepareSessionState,
   readBridgeState,
   readBridgeStateForStop,
+  removeBridgeState,
   writeBridgeState,
 } from "../src/bridge-state.js";
 import {
@@ -60,7 +68,10 @@ describe("protected bridge state", () => {
   });
 
   afterEach(() => {
+    vi.mocked(lstatSync).mockRestore();
     vi.mocked(mkdirSync).mockRestore();
+    vi.mocked(readFileSync).mockRestore();
+    vi.mocked(unlinkSync).mockRestore();
     rmSync(home.value, { recursive: true, force: true });
   });
 
@@ -95,6 +106,115 @@ describe("protected bridge state", () => {
       "bridge.pid",
     ]);
   });
+
+  describe.each(["default", "worker-1"])(
+    "concurrent cleanup for %s",
+    (session) => {
+      it.each([
+        ["read", "lstat"],
+        ["read", "read"],
+        ["stop", "lstat"],
+        ["stop", "read"],
+        ["remove", "lstat"],
+        ["remove", "read"],
+        ["remove", "unlink"],
+      ])(
+        "handles %s failing at %s only when the record disappeared",
+        async (action, boundary) => {
+          const filesystem =
+            await vi.importActual<typeof import("node:fs")>("node:fs");
+          const stateFile = resolveSessionPidFile(session);
+          const failure = new Error("State operation failed");
+          for (const should_disappear of [false, true]) {
+            writeBridgeState(9224, "a".repeat(64), session);
+            const state = filesystem.readFileSync(stateFile, "utf8");
+            let has_failed = false;
+            const fail = () => {
+              has_failed = true;
+              if (should_disappear) filesystem.unlinkSync(stateFile);
+              throw failure;
+            };
+            if (boundary === "lstat") {
+              vi.mocked(lstatSync).mockImplementation((path, options) => {
+                if (path === stateFile && !has_failed) fail();
+                return filesystem.lstatSync(path, options);
+              });
+            } else if (boundary === "read") {
+              vi.mocked(readFileSync).mockImplementation((path, options) => {
+                if (path === stateFile && !has_failed) fail();
+                return filesystem.readFileSync(path, options);
+              });
+            } else {
+              vi.mocked(unlinkSync).mockImplementation((path) => {
+                if (path === stateFile && !has_failed) fail();
+                return filesystem.unlinkSync(path);
+              });
+            }
+            const operation = () =>
+              action === "read"
+                ? readBridgeState(session)
+                : action === "stop"
+                  ? readBridgeStateForStop(session, true)
+                  : removeBridgeState(process.pid, session);
+
+            if (should_disappear) {
+              expect(operation()).toBe(action === "remove" ? undefined : null);
+              expect(existsSync(stateFile)).toBe(false);
+            } else {
+              expect(operation).toThrow();
+              expect(filesystem.readFileSync(stateFile, "utf8")).toBe(state);
+            }
+            expect(has_failed).toBe(true);
+            vi.mocked(lstatSync).mockRestore();
+            vi.mocked(readFileSync).mockRestore();
+            vi.mocked(unlinkSync).mockRestore();
+          }
+        },
+      );
+
+      it("rejects malformed records during reads, stop and removal", () => {
+        writeBridgeState(9224, "a".repeat(64), session);
+        const stateFile = resolveSessionPidFile(session);
+        writeFileSync(stateFile, "not json");
+
+        expect(() => readBridgeState(session)).toThrow(/Invalid/);
+        expect(() => readBridgeStateForStop(session, true)).toThrow(/Invalid/);
+        expect(() => removeBridgeState(process.pid, session)).toThrow(
+          /Invalid/,
+        );
+        expect(readFileSync(stateFile, "utf8")).toBe("not json");
+      });
+
+      it("fails closed when the disappearance recheck cannot access the record", () => {
+        writeBridgeState(9224, "a".repeat(64), session);
+        const stateFile = resolveSessionPidFile(session);
+        vi.mocked(readFileSync).mockImplementationOnce(() => {
+          vi.mocked(lstatSync).mockImplementationOnce(() => {
+            throw Object.assign(new Error("Access denied"), { code: "EACCES" });
+          });
+          throw new Error("Read failed");
+        });
+
+        expect(() => readBridgeState(session)).toThrow();
+        expect(existsSync(stateFile)).toBe(true);
+      });
+
+      it.runIf(process.platform === "win32")(
+        "treats disappearance during stop migration as missing state",
+        () => {
+          writeBridgeState(9224, "a".repeat(64), session);
+          const stateFile = resolveSessionPidFile(session);
+          secureWindowsPath.mockImplementationOnce(() => {
+            unlinkSync(stateFile);
+            throw new Error("Windows bridge ACL verification failed");
+          });
+
+          expect(readBridgeStateForStop(session, true)).toBeNull();
+          expect(existsSync(stateFile)).toBe(false);
+        },
+      );
+    },
+  );
 
   it("treats missing or malformed state as nothing to remove", () => {
     expect(() => removePidFile(process.pid, "default")).not.toThrow();
@@ -132,6 +252,37 @@ describe("protected bridge state", () => {
   );
 
   describe.runIf(process.platform !== "win32")("POSIX state migration", () => {
+    it.each([false, true])(
+      "handles disappearance during directory verification with migration %s",
+      async (should_migrate) => {
+        const filesystem =
+          await vi.importActual<typeof import("node:fs")>("node:fs");
+        writeBridgeState(9224, "a".repeat(64), "worker-1");
+        const stateFile = resolveSessionPidFile("worker-1");
+        const root = resolveSessionStateDir("default");
+        vi.mocked(lstatSync).mockImplementation((path, options) => {
+          if (path === root) {
+            unlinkSync(stateFile);
+            throw new Error("Directory verification failed");
+          }
+          return filesystem.lstatSync(path, options);
+        });
+
+        expect(readBridgeStateForStop("worker-1", should_migrate)).toBeNull();
+        expect(existsSync(stateFile)).toBe(false);
+      },
+    );
+
+    it("rejects a dangling state symlink as unsafe rather than absent", () => {
+      prepareSessionState("default");
+      const stateFile = resolveSessionPidFile("default");
+      symlinkSync(join(home.value, "missing-state"), stateFile);
+
+      expect(() => readBridgeState("default")).toThrow(/Unsafe/);
+      expect(() => readBridgeStateForStop("default", true)).toThrow(/Unsafe/);
+      expect(lstatSync(stateFile).isSymbolicLink()).toBe(true);
+    });
+
     it.each(["default", "worker-1"])(
       "repairs legacy directories on a fresh start for %s",
       (session) => {

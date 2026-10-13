@@ -87,27 +87,44 @@ export function prepareSessionState(sessionName = resolveSessionName()): void {
   }
 }
 
-function readState(sessionName: string): Record<string, unknown> | null {
+function readState(
+  sessionName: string,
+  should_migrate = false,
+): Record<string, unknown> | null {
   const directories = stateDirectories(sessionName);
   const path = resolveSessionPidFile(sessionName);
-  if (!existsSync(path)) return null;
-  for (const path of directories) {
-    if (!existsSync(path)) return null;
-    if (process.platform !== "win32") verifyPosixPath(path, true);
-  }
-  if (process.platform === "win32") {
-    if (lstatSync(path).nlink !== 1) throw new Error(UNSAFE_STATE_MESSAGE);
-    verifyWindowsState(directories, path);
-  } else verifyPosixPath(path, false);
   try {
-    const data: unknown = JSON.parse(readFileSync(path, "utf8"));
-    if (data === null || typeof data !== "object" || Array.isArray(data))
-      throw new Error();
-    return data as Record<string, unknown>;
-  } catch {
-    throw new Error(
-      "Invalid authenticated bridge state. Run stop, then start this session",
-    );
+    if (!lstatSync(path, { throwIfNoEntry: false })) return null;
+    if (should_migrate) {
+      if (process.platform === "win32") {
+        if (lstatSync(path).nlink !== 1) throw new Error(UNSAFE_STATE_MESSAGE);
+        secureWindowsPaths(directories, "prepare-directory", path);
+      } else {
+        for (const directory of directories)
+          verifyPosixPath(directory, true, true);
+        verifyPosixPath(path, false, true);
+      }
+    }
+    if (process.platform === "win32") {
+      if (lstatSync(path).nlink !== 1) throw new Error(UNSAFE_STATE_MESSAGE);
+      verifyWindowsState(directories, path);
+    } else {
+      for (const directory of directories) verifyPosixPath(directory, true);
+      verifyPosixPath(path, false);
+    }
+    try {
+      const data: unknown = JSON.parse(readFileSync(path, "utf8"));
+      if (data === null || typeof data !== "object" || Array.isArray(data))
+        throw new Error();
+      return data as Record<string, unknown>;
+    } catch {
+      throw new Error(
+        "Invalid authenticated bridge state. Run stop, then start this session",
+      );
+    }
+  } catch (error) {
+    if (!lstatSync(path, { throwIfNoEntry: false })) return null;
+    throw error;
   }
 }
 
@@ -115,20 +132,7 @@ export function readBridgeStateForStop(
   sessionName = resolveSessionName(),
   should_migrate = false,
 ): { pid: number; port: number } | null {
-  if (should_migrate) {
-    const directories = stateDirectories(sessionName);
-    const path = resolveSessionPidFile(sessionName);
-    if (!existsSync(path)) return null;
-    if (process.platform === "win32") {
-      if (lstatSync(path).nlink !== 1) throw new Error(UNSAFE_STATE_MESSAGE);
-      secureWindowsPaths(directories, "prepare-directory", path);
-    } else {
-      for (const directory of directories)
-        verifyPosixPath(directory, true, true);
-      verifyPosixPath(path, false, true);
-    }
-  }
-  const data = readState(sessionName);
+  const data = readState(sessionName, should_migrate);
   if (!data) return null;
   if (
     !Number.isSafeInteger(data.pid) ||
@@ -216,5 +220,12 @@ export function removeBridgeState(
   sessionName = resolveSessionName(),
 ): void {
   const state = readBridgeStateForStop(sessionName);
-  if (state?.pid === pid) unlinkSync(resolveSessionPidFile(sessionName));
+  if (state?.pid === pid) {
+    const path = resolveSessionPidFile(sessionName);
+    try {
+      unlinkSync(path);
+    } catch (error) {
+      if (lstatSync(path, { throwIfNoEntry: false })) throw error;
+    }
+  }
 }
