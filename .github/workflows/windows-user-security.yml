@@ -1,0 +1,36 @@
+name: windows-user-security
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main, fix/windows-user-bridge-auth]
+    paths-ignore:
+      - .release-please-manifest.json
+      - CHANGELOG.md
+      - package.json
+
+permissions:
+  contents: read
+
+jobs:
+  cross-user-proof:
+    if: github.repository == 'fpresta0607/chrome-devtools-axi'
+    runs-on: windows-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - uses: pnpm/action-setup@v4
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24
+          cache: pnpm
+
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm exec tsc
+      - name: Prove the Windows user boundary without Chrome
+        shell: pwsh
+        run: ./scripts/windows-user-security.ps1
