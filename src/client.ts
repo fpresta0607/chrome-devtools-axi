@@ -309,11 +309,10 @@ function isBridgeProcess(pid: number, port: number): boolean {
 }
 
 /**
- * Terminate a bridge process and reap its detached process group. Sends
- * SIGTERM, polls up to ~2s for exit, then escalates to SIGKILL on the entire
- * process group so chrome-devtools-mcp / Chrome children can't survive as
- * orphans. Returns once the bridge PID is gone (or the SIGKILL grace window
- * expires).
+ * Terminate a bridge process and, when requested, its owned children so they
+ * cannot survive as orphans. Windows tree termination uses taskkill /T /F.
+ * POSIX termination sends SIGTERM, then escalates to SIGKILL on the detached
+ * process group. Returns once the bridge PID is gone or the exit grace expires.
  */
 export async function terminateBridgeProcess(
   pid: number,
@@ -1009,10 +1008,8 @@ export async function getSessionSnapshotIfRunning(): Promise<string | null> {
 }
 
 /**
- * Stop the bridge process. Waits for the bridge PID to actually exit (bounded
- * poll, ~2s) before escalating to SIGKILL on the entire detached process
- * group, so chrome-devtools-mcp + Chrome children get reaped together rather
- * than orphaned. Resolves once the bridge process is gone.
+ * Stop the verified bridge and its owned children via {@link terminateBridgeProcess}.
+ * Resolves once the bridge process is gone, leaving unrelated processes untouched.
  */
 export async function stopBridge(): Promise<boolean> {
   const pidInfo = readBridgeStateForStop(resolveSessionName(), true);

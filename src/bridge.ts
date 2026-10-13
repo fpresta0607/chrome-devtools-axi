@@ -2,7 +2,7 @@
  * Persistent MCP bridge server for chrome-devtools-axi.
  *
  * Selects either a local/proxy stdio session or a direct Streamable HTTP
- * session and maintains it persistently. Exposes a simple HTTP API:
+ * session and maintains it persistently. Exposes an authenticated HTTP API:
  *   POST /call  { name, args }  → { result }
  *   GET  /tools                 → [{ name, description }]
  *   GET  /health                → { status: "ok", session } or 503 { status: "error", error }
@@ -11,9 +11,7 @@
  *                                 chrome-devtools-mcp's one-shot reconnect marker *and*
  *                                 that dropped a persisted page selection
  *
- * Writes a PID file to the active session's state dir on startup
- * (~/.chrome-devtools-axi/bridge.pid for the default session; named sessions
- * nest under sessions/<name>/ - see src/sessions.ts).
+ * See README.md#bridge-security for the authentication and state boundary.
  */
 
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
@@ -192,10 +190,9 @@ export function getErrorMessage(error: unknown): string {
 }
 
 /**
- * Hostnames that identify the loopback interface. The bridge is a persistent
- * unauthenticated loopback service on a known port, so it is the target of
- * DNS-rebinding: a malicious page rebinds its own domain to 127.0.0.1 and the
- * browser then issues same-origin requests that hit the bridge. Binding to
+ * Hostnames that identify the loopback interface. A malicious page can rebind
+ * its own domain to 127.0.0.1, causing the browser to issue same-origin requests
+ * that hit the bridge. Binding to
  * 127.0.0.1 does NOT stop this - the packets still arrive on loopback. The one
  * thing a rebound request cannot hide is that it carries the attacker's own
  * domain in the `Host` (and `Origin`) header, and those are forbidden headers
@@ -614,8 +611,10 @@ export async function handleBridgeRequest(
 }
 
 /**
- * Whether a finished request renews an opted-in idle timeout: any request the
- * anti-rebinding gate accepts, except the CLI's ambient home-view probe.
+ * Whether an already authenticated request renews an opted-in idle timeout.
+ * The ambient home-view probe must not keep an abandoned bridge alive.
+ * The deep health probe before a command does renew it, preventing shutdown
+ * between that probe and the command's own call.
  */
 export function isIdleActivity(req: IncomingMessage): boolean {
   return isRequestAllowed(req) && req.headers[AMBIENT_REQUEST_HEADER] !== "1";
