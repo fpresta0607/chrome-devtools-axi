@@ -164,7 +164,11 @@ async function proveOwner() {
     async callTool({ name }) {
       toolCalls++;
       assert.equal(name, "list_pages");
-      return { content: [{ type: "text", text: `0: ${PAGE_URL} [selected]` }] };
+      return {
+        content: [
+          { type: "text", text: `## Pages\n1: ${PAGE_URL} [selected]` },
+        ],
+      };
     },
     async close() {},
   };

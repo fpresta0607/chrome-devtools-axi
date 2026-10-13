@@ -5,6 +5,8 @@ import { createConnection, createServer, type AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
+import { createAuthHeaders } from "../src/bridge-auth.js";
+import { parsePagesList } from "../src/pages.js";
 
 /**
  * Runs the real bridge process, detached as `ensureBridge` spawns it, against
@@ -136,6 +138,31 @@ afterEach(() => {
 });
 
 describe("bridge process lifecycle", () => {
+  it("serves pages after initial and changed workspace roots", async () => {
+    const running = await startBridge();
+    const { port, secret } = JSON.parse(readFileSync(running.pidFile, "utf8"));
+
+    for (const roots of [[running.home], [running.home], [ROOT]]) {
+      const body = JSON.stringify({ name: "list_pages", args: {}, roots });
+      const response = await fetch(`http://127.0.0.1:${port}/call`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          ...createAuthHeaders(secret, "POST", "/call", body),
+        },
+        body,
+        signal: AbortSignal.timeout(5_000),
+      });
+      const payload = await response.json();
+
+      expect(payload.error).toBeUndefined();
+      expect(response.status).toBe(200);
+      expect(parsePagesList(payload.result)).toEqual([
+        { id: 1, url: "about:blank", selected: true },
+      ]);
+    }
+  }, 30_000);
+
   it("stays up while idle when no idle timeout is configured", async () => {
     const running = await startBridge();
 

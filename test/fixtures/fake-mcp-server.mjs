@@ -9,11 +9,18 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import { RootsListChangedNotificationSchema } from "@modelcontextprotocol/sdk/types.js";
 
 const server = new McpServer({
   name: "fake-chrome-devtools-mcp",
   version: "0.0.0",
 });
+server.server.setNotificationHandler(
+  RootsListChangedNotificationSchema,
+  async () => {
+    await server.server.listRoots();
+  },
+);
 server.registerTool("list_pages", { description: "List pages" }, async () => ({
   content: [{ type: "text", text: "## Pages\n1: about:blank [selected]" }],
 }));
