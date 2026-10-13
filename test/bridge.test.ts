@@ -23,7 +23,7 @@ import {
   extractHostHeaderHostname,
   extractToolText,
   getErrorMessage,
-  handleBridgeRequest,
+  handleBridgeRequest as handleAuthenticatedBridgeRequest,
   isAllowedBridgeHost,
   isRequestAllowed,
   isRequestOriginAllowed,
@@ -34,7 +34,6 @@ import {
   isIdleActivity,
   PAGE_IDENTITY_CHANGED_ERROR,
   parseBridgeCallPayload,
-  removePidFile,
   resolveBridgeScript,
   resolveTransport,
   resolveTransportSpec,
@@ -42,12 +41,29 @@ import {
 } from "../src/bridge.js";
 import { pathToFileURL } from "node:url";
 import { AMBIENT_REQUEST_HEADER } from "../src/bridge-script.js";
+import { createAuthHeaders, createBridgeAuth } from "../src/bridge-auth.js";
 import type { IdleTracker } from "../src/idle.js";
 import {
   clearSelectedPageId,
   getSelectedPageId,
   setSelectedPageId,
 } from "../src/selected-page.js";
+
+const AUTH_SECRET = "a".repeat(64);
+const AUTH = createBridgeAuth(AUTH_SECRET);
+function handleBridgeRequest(
+  ...args: Parameters<typeof handleAuthenticatedBridgeRequest>
+): Promise<void> {
+  return handleAuthenticatedBridgeRequest(
+    args[0],
+    args[1],
+    args[2],
+    args[3],
+    args[4],
+    args[5],
+    AUTH,
+  );
+}
 
 const RECONNECT_NOTICE_LINE =
   "Note: the browser was restarted or reconnected since the last call. Page ids have changed. Call list_pages to see open pages.";
@@ -627,6 +643,7 @@ describe("resolveTransportSpec", () => {
       const spec = resolveTransportSpec();
       const output = execFileSync(spec.command, spec.args, {
         encoding: "utf8",
+        windowsHide: true,
       });
 
       expect(JSON.parse(output)).toEqual([
@@ -776,6 +793,7 @@ process.stdout.write(JSON.stringify(resolveTransportSpec()));`,
           cwd: dir,
           env,
           encoding: "utf8",
+          windowsHide: true,
         },
       );
       return JSON.parse(output);
@@ -1382,13 +1400,23 @@ function makeRequest(
   // Real requests always carry a Host header; the CLI client sends
   // "127.0.0.1:<port>". Default to loopback so the anti-rebinding gate lets
   // these through, and let callers override to exercise rejection.
-  req.headers = { host: "127.0.0.1:9224", ...headers };
+  req.headers = {
+    host: "127.0.0.1:9224",
+    ...createAuthHeaders(
+      AUTH_SECRET,
+      method,
+      url,
+      body ?? "",
+      headers[AMBIENT_REQUEST_HEADER] === "1",
+    ),
+    ...headers,
+  };
   // Feed a request body so handlers that read the stream (e.g. /call) don't
   // hang waiting on EOF. Rejected requests short-circuit before reading it.
   if (body !== undefined) {
     req.push(body);
-    req.push(null);
   }
+  req.push(null);
   return req;
 }
 
@@ -1524,9 +1552,11 @@ describe("handleBridgeRequest /health", () => {
 
   it("invalidates a named session's persisted routing when a deep probe reconnects the browser", async () => {
     const savedHome = process.env.HOME;
+    const savedUserProfile = process.env.USERPROFILE;
     const savedSession = process.env.CHROME_DEVTOOLS_AXI_SESSION;
     const home = mkdtempSync(join(tmpdir(), "axi-reconnect-health-"));
     process.env.HOME = home;
+    process.env.USERPROFILE = home;
     process.env.CHROME_DEVTOOLS_AXI_SESSION = "reconnect-worker";
     try {
       setSelectedPageId(42);
@@ -1583,6 +1613,8 @@ describe("handleBridgeRequest /health", () => {
     } finally {
       if (savedHome === undefined) delete process.env.HOME;
       else process.env.HOME = savedHome;
+      if (savedUserProfile === undefined) delete process.env.USERPROFILE;
+      else process.env.USERPROFILE = savedUserProfile;
       if (savedSession === undefined)
         delete process.env.CHROME_DEVTOOLS_AXI_SESSION;
       else process.env.CHROME_DEVTOOLS_AXI_SESSION = savedSession;
@@ -1861,8 +1893,7 @@ describe("handleBridgeRequest anti-rebinding gate", () => {
     );
 
     expect(logs).toHaveLength(1);
-    expect(logs[0]).toContain("evil.attacker.com");
-    expect(logs[0]).toContain("/call");
+    expect(logs[0]).toBe("Rejected request with disallowed host or origin");
   });
 
   it("does not log when a request is allowed", async () => {
@@ -1933,9 +1964,11 @@ describe("handleBridgeRequest /call error + roots", () => {
 
   it("fails an explicitly routed /call and drops the selection when a reconnect reissues page ids, but not when page text merely quotes the marker", async () => {
     const savedHome = process.env.HOME;
+    const savedUserProfile = process.env.USERPROFILE;
     const savedSession = process.env.CHROME_DEVTOOLS_AXI_SESSION;
     const home = mkdtempSync(join(tmpdir(), "axi-reconnect-call-"));
     process.env.HOME = home;
+    process.env.USERPROFILE = home;
     process.env.CHROME_DEVTOOLS_AXI_SESSION = "reconnect-call";
     const reconnectNote =
       "Note: the browser was restarted or reconnected since the last call. Page ids have changed. Call list_pages to see open pages.";
@@ -2047,6 +2080,8 @@ describe("handleBridgeRequest /call error + roots", () => {
     } finally {
       if (savedHome === undefined) delete process.env.HOME;
       else process.env.HOME = savedHome;
+      if (savedUserProfile === undefined) delete process.env.USERPROFILE;
+      else process.env.USERPROFILE = savedUserProfile;
       if (savedSession === undefined)
         delete process.env.CHROME_DEVTOOLS_AXI_SESSION;
       else process.env.CHROME_DEVTOOLS_AXI_SESSION = savedSession;
@@ -2408,49 +2443,6 @@ describe("handleBridgeServerError", () => {
   });
 });
 
-describe("removePidFile ownership", () => {
-  let dir: string;
-  let pidFile: string;
-
-  beforeEach(() => {
-    dir = mkdtempSync(join(tmpdir(), "cda-pid-"));
-    pidFile = join(dir, "bridge.pid");
-  });
-
-  afterEach(() => {
-    rmSync(dir, { recursive: true, force: true });
-  });
-
-  it("leaves the winner's PID file intact when a same-session loser exits", () => {
-    const winnerPid = process.pid + 1;
-    const loserPid = process.pid + 2;
-    writeFileSync(pidFile, JSON.stringify({ pid: winnerPid, port: 9224 }));
-
-    // The EADDRINUSE loser's exit handler must not delete the winner's handle.
-    removePidFile(pidFile, loserPid);
-
-    expect(existsSync(pidFile)).toBe(true);
-  });
-
-  it("removes the PID file when this process owns it", () => {
-    const ownerPid = process.pid + 3;
-    writeFileSync(pidFile, JSON.stringify({ pid: ownerPid, port: 9224 }));
-
-    removePidFile(pidFile, ownerPid);
-
-    expect(existsSync(pidFile)).toBe(false);
-  });
-
-  it("treats a missing or malformed PID file as nothing to remove", () => {
-    expect(() => removePidFile(pidFile, process.pid)).not.toThrow();
-    expect(existsSync(pidFile)).toBe(false);
-
-    writeFileSync(pidFile, "not json");
-    expect(() => removePidFile(pidFile, process.pid)).not.toThrow();
-    expect(existsSync(pidFile)).toBe(true);
-  });
-});
-
 describe("createBridgeServer", () => {
   const postCall = (port: number, payload: unknown): Promise<string> =>
     new Promise((resolvePost, rejectPost) => {
@@ -2461,7 +2453,10 @@ describe("createBridgeServer", () => {
           port,
           path: "/call",
           method: "POST",
-          headers: { "Content-Length": Buffer.byteLength(body) },
+          headers: {
+            ...createAuthHeaders(AUTH_SECRET, "POST", "/call", body),
+            "Content-Length": Buffer.byteLength(body),
+          },
         },
         (res) => {
           let received = "";
@@ -2477,9 +2472,11 @@ describe("createBridgeServer", () => {
 
   it("wires reconnect invalidation into the served /call route", async () => {
     const savedHome = process.env.HOME;
+    const savedUserProfile = process.env.USERPROFILE;
     const savedSession = process.env.CHROME_DEVTOOLS_AXI_SESSION;
     const home = mkdtempSync(join(tmpdir(), "axi-reconnect-server-"));
     process.env.HOME = home;
+    process.env.USERPROFILE = home;
     process.env.CHROME_DEVTOOLS_AXI_SESSION = "reconnect-server";
     const client: BridgeClient = {
       listTools: async () => ({ tools: [] }),
@@ -2489,7 +2486,12 @@ describe("createBridgeServer", () => {
       }),
       close: async () => {},
     };
-    const server = createBridgeServer(client, "reconnect-server");
+    const server = createBridgeServer(
+      client,
+      "reconnect-server",
+      undefined,
+      createBridgeAuth(AUTH_SECRET),
+    );
     try {
       setSelectedPageId(3);
       await new Promise<void>((ready) => {
@@ -2510,6 +2512,8 @@ describe("createBridgeServer", () => {
       });
       if (savedHome === undefined) delete process.env.HOME;
       else process.env.HOME = savedHome;
+      if (savedUserProfile === undefined) delete process.env.USERPROFILE;
+      else process.env.USERPROFILE = savedUserProfile;
       if (savedSession === undefined)
         delete process.env.CHROME_DEVTOOLS_AXI_SESSION;
       else process.env.CHROME_DEVTOOLS_AXI_SESSION = savedSession;
@@ -2553,11 +2557,30 @@ describe("idle activity", () => {
         return (activity) => events.push(`end:${activity}`);
       },
     };
-    const server = createBridgeServer(client, "idle-server", idle);
+    const server = createBridgeServer(
+      client,
+      "idle-server",
+      idle,
+      createBridgeAuth(AUTH_SECRET),
+    );
     const send = (path: string, headers: Record<string, string> = {}) =>
       new Promise<number | undefined>((done, fail) => {
         const req = request(
-          { host: "127.0.0.1", port, path, headers },
+          {
+            host: "127.0.0.1",
+            port,
+            path,
+            headers: {
+              ...createAuthHeaders(
+                AUTH_SECRET,
+                "GET",
+                path,
+                "",
+                headers[AMBIENT_REQUEST_HEADER] === "1",
+              ),
+              ...headers,
+            },
+          },
           (res) => {
             res.resume();
             res.on("end", () => done(res.statusCode));

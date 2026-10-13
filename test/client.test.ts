@@ -1,7 +1,12 @@
-import { describe, expect, it, beforeEach, afterEach } from "vitest";
+import { describe, expect, it, beforeEach, afterEach, vi } from "vitest";
 import { spawn } from "node:child_process";
 import { EventEmitter } from "node:events";
-import { createServer, type Server } from "node:http";
+import {
+  createServer,
+  type Server,
+  type IncomingMessage,
+  type ServerResponse,
+} from "node:http";
 import { AddressInfo } from "node:net";
 import {
   mkdtempSync,
@@ -20,6 +25,39 @@ import {
   type BridgeClient,
 } from "../src/bridge.js";
 import { AMBIENT_REQUEST_HEADER } from "../src/bridge-script.js";
+import { createBridgeAuth, RESPONSE_PROOF_HEADER } from "../src/bridge-auth.js";
+import { writeBridgeState } from "../src/bridge-state.js";
+
+vi.mock("../src/windows-acl.js", () => ({
+  secureWindowsPaths: (paths: string[], mode: string) => {
+    if (mode === "prepare-directory")
+      paths.forEach((path) => mkdirSync(path, { recursive: true }));
+  },
+  secureWindowsPath: (path: string, mode: string) => {
+    if (mode === "prepare-directory") mkdirSync(path, { recursive: true });
+  },
+  verifyWindowsBridgeProcess: () => {
+    throw new Error("Unverified test PID");
+  },
+}));
+
+const AUTH_SECRET = "a".repeat(64);
+const RESPONSE_AUTH = createBridgeAuth(AUTH_SECRET);
+function signFakeResponse(req: IncomingMessage, res: ServerResponse): void {
+  const end = res.end.bind(res);
+  res.end = ((body: string) => {
+    res.setHeader(
+      RESPONSE_PROOF_HEADER,
+      RESPONSE_AUTH.signResponse(
+        req.headers.authorization ?? "",
+        res.statusCode,
+        body,
+      ),
+    );
+    return end(body);
+  }) as typeof res.end;
+}
+
 import { setSelectedPageId } from "../src/selected-page.js";
 import {
   buildBridgeEarlyExitError,
@@ -173,6 +211,7 @@ function startFakeBridgeServer(opts: FakeBridgeOptions): Promise<{
 }> {
   return new Promise((resolveStart, rejectStart) => {
     const server = createServer((req, res) => {
+      signFakeResponse(req, res);
       if (req.method === "GET" && req.url?.startsWith("/health")) {
         const wantsDeep = req.url.includes("deep=1");
         const outcome = wantsDeep ? opts.deep : opts.shallow;
@@ -212,10 +251,33 @@ function startFakeBridgeServer(opts: FakeBridgeOptions): Promise<{
 }
 
 describe("checkBridgeHealth (deep probe)", () => {
+  it("rejects unsigned health from a port squatter without exposing the state secret", async () => {
+    let observedHeaders = "";
+    const server = createServer((req, res) => {
+      observedHeaders = JSON.stringify(req.headers);
+      res.end(JSON.stringify({ status: "ok", session: "worker-1" }));
+    });
+    await new Promise<void>((ready) => server.listen(0, "127.0.0.1", ready));
+    try {
+      const { port } = server.address() as AddressInfo;
+      await expect(
+        checkBridgeHealth(port, {
+          secret: AUTH_SECRET,
+          expectedSession: "worker-1",
+        }),
+      ).rejects.toThrow("Bridge authentication failed");
+      expect(observedHeaders).not.toContain(AUTH_SECRET);
+    } finally {
+      await new Promise<void>((closed) => server.close(() => closed()));
+    }
+  });
+
   it("returns true on a shallow probe when /health responds 200 ok", async () => {
     const fake = await startFakeBridgeServer({ shallow: "ok", deep: "error" });
     try {
-      expect(await checkBridgeHealth(fake.port)).toBe(true);
+      expect(await checkBridgeHealth(fake.port, { secret: AUTH_SECRET })).toBe(
+        true,
+      );
     } finally {
       await fake.close();
     }
@@ -227,8 +289,12 @@ describe("checkBridgeHealth (deep probe)", () => {
     // deep probe correctly reports unhealthy.
     const fake = await startFakeBridgeServer({ shallow: "ok", deep: "error" });
     try {
-      expect(await checkBridgeHealth(fake.port)).toBe(true);
-      expect(await checkBridgeHealth(fake.port, { deep: true })).toBe(false);
+      expect(await checkBridgeHealth(fake.port, { secret: AUTH_SECRET })).toBe(
+        true,
+      );
+      expect(
+        await checkBridgeHealth(fake.port, { secret: AUTH_SECRET, deep: true }),
+      ).toBe(false);
     } finally {
       await fake.close();
     }
@@ -237,7 +303,9 @@ describe("checkBridgeHealth (deep probe)", () => {
   it("returns true on the deep probe when the bridge reports both layers healthy", async () => {
     const fake = await startFakeBridgeServer({ shallow: "ok", deep: "ok" });
     try {
-      expect(await checkBridgeHealth(fake.port, { deep: true })).toBe(true);
+      expect(
+        await checkBridgeHealth(fake.port, { secret: AUTH_SECRET, deep: true }),
+      ).toBe(true);
     } finally {
       await fake.close();
     }
@@ -250,7 +318,9 @@ describe("checkBridgeHealth (deep probe)", () => {
       deepDelayMs: 2200,
     });
     try {
-      expect(await checkBridgeHealth(fake.port, { deep: true })).toBe(true);
+      expect(
+        await checkBridgeHealth(fake.port, { secret: AUTH_SECRET, deep: true }),
+      ).toBe(true);
     } finally {
       await fake.close();
     }
@@ -270,28 +340,38 @@ describe("checkBridgeHealth (deep probe)", () => {
     });
     try {
       expect(
-        await checkBridgeHealth(fake.port, { expectedSession: "worker-2" }),
+        await checkBridgeHealth(fake.port, {
+          secret: AUTH_SECRET,
+          expectedSession: "worker-2",
+        }),
       ).toBe(false);
       expect(
         await checkBridgeHealth(fake.port, {
+          secret: AUTH_SECRET,
           deep: true,
           expectedSession: "worker-2",
         }),
       ).toBe(false);
       expect(
-        await checkBridgeHealth(fake.port, { expectedSession: "worker-1" }),
+        await checkBridgeHealth(fake.port, {
+          secret: AUTH_SECRET,
+          expectedSession: "worker-1",
+        }),
       ).toBe(true);
     } finally {
       await fake.close();
     }
   });
 
-  it("accepts a bridge that omits the session field (older version)", async () => {
+  it("rejects a bridge that omits the session field (older version)", async () => {
     const fake = await startFakeBridgeServer({ shallow: "ok", deep: "ok" });
     try {
       expect(
-        await checkBridgeHealth(fake.port, { expectedSession: "worker-1" }),
-      ).toBe(true);
+        await checkBridgeHealth(fake.port, {
+          secret: AUTH_SECRET,
+          expectedSession: "worker-1",
+        }),
+      ).toBe(false);
     } finally {
       await fake.close();
     }
@@ -399,6 +479,7 @@ describe("buildBridgeEarlyExitError", () => {
 describe("ensureBridge early-exit fast-fail", () => {
   const savedSession = process.env.CHROME_DEVTOOLS_AXI_SESSION;
   const savedHome = process.env.HOME;
+  const savedUserProfile = process.env.USERPROFILE;
   const savedTimeout = process.env.CHROME_DEVTOOLS_AXI_BRIDGE_TIMEOUT_MS;
   const savedPort = process.env.CHROME_DEVTOOLS_AXI_PORT;
   let tmpHome: string;
@@ -413,6 +494,7 @@ describe("ensureBridge early-exit fast-fail", () => {
     // ensureBridge is forced down the spawn-a-new-bridge path.
     tmpHome = mkdtempSync(join(tmpdir(), "axi-ensure-bridge-"));
     process.env.HOME = tmpHome;
+    process.env.USERPROFILE = tmpHome;
     process.env.CHROME_DEVTOOLS_AXI_SESSION = "early-exit-worker";
     delete process.env.CHROME_DEVTOOLS_AXI_PORT;
     // A long deadline so the assertion proves the *early-exit* path returns
@@ -423,6 +505,7 @@ describe("ensureBridge early-exit fast-fail", () => {
   afterEach(() => {
     restore("CHROME_DEVTOOLS_AXI_SESSION", savedSession);
     restore("HOME", savedHome);
+    restore("USERPROFILE", savedUserProfile);
     restore("CHROME_DEVTOOLS_AXI_BRIDGE_TIMEOUT_MS", savedTimeout);
     restore("CHROME_DEVTOOLS_AXI_PORT", savedPort);
     rmSync(tmpHome, { recursive: true, force: true });
@@ -482,6 +565,7 @@ describe("ensureBridge early-exit fast-fail", () => {
     // pre-throw final deep check is what catches the winner.
     let deepProbes = 0;
     const winner = createServer((req, res) => {
+      signFakeResponse(req, res);
       if (req.method === "GET" && req.url?.startsWith("/health")) {
         const wantsDeep = req.url.includes("deep=1");
         if (wantsDeep) deepProbes++;
@@ -506,6 +590,7 @@ describe("ensureBridge early-exit fast-fail", () => {
 
     try {
       const port = await ensureBridge(() => {
+        writeBridgeState(winnerPort, AUTH_SECRET, "early-exit-worker");
         const loser = new EventEmitter();
         setImmediate(() =>
           loser.emit("exit", BRIDGE_PORT_IN_USE_EXIT_CODE, null),
@@ -524,6 +609,7 @@ describe("waitForProcessExit", () => {
   it("returns true once the process is gone", async () => {
     const child = spawn(process.execPath, ["-e", "setTimeout(() => {}, 200)"], {
       stdio: "ignore",
+      windowsHide: true,
     });
     expect(child.pid).toBeDefined();
     const pid = child.pid as number;
@@ -542,6 +628,7 @@ describe("waitForProcessExit", () => {
       ["-e", "setTimeout(() => {}, 5000)"],
       {
         stdio: "ignore",
+        windowsHide: true,
       },
     );
     const pid = child.pid as number;
@@ -594,7 +681,7 @@ describe("terminateBridgeProcess", () => {
         "-e",
         "process.on('SIGTERM', () => process.exit(0)); setTimeout(() => {}, 30000);",
       ],
-      { stdio: "ignore", detached: true },
+      { stdio: "ignore", windowsHide: true, detached: true },
     );
     const pid = child.pid as number;
     child.unref();
@@ -619,7 +706,7 @@ describe("terminateBridgeProcess", () => {
     const child = spawn(
       process.execPath,
       ["-e", "process.on('SIGTERM', () => {}); setTimeout(() => {}, 30000);"],
-      { stdio: "ignore", detached: true },
+      { stdio: "ignore", windowsHide: true, detached: true },
     );
     const pid = child.pid as number;
     child.unref();
@@ -638,7 +725,10 @@ describe("terminateBridgeProcess", () => {
 
   it("is a no-op when the pid is already gone", async () => {
     // Pick a likely-unused pid by spawning + waiting for it to exit.
-    const child = spawn(process.execPath, ["-e", ""], { stdio: "ignore" });
+    const child = spawn(process.execPath, ["-e", ""], {
+      stdio: "ignore",
+      windowsHide: true,
+    });
     const pid = child.pid as number;
     await new Promise<void>((r) => child.on("exit", () => r()));
 
@@ -654,13 +744,13 @@ describe("terminateBridgeProcess", () => {
         "-e",
         [
           "const { spawn } = require('node:child_process');",
-          "const child = spawn(process.execPath, ['-e', 'setTimeout(() => {}, 30000)'], { stdio: 'ignore' });",
+          "const child = spawn(process.execPath, ['-e', 'setTimeout(() => {}, 30000)'], { stdio: 'ignore', windowsHide: true });",
           `require('node:fs').writeFileSync(${JSON.stringify(childPidFile)}, String(child.pid));`,
           "process.on('SIGTERM', () => {});",
           "setTimeout(() => {}, 30000);",
         ].join(""),
       ],
-      { stdio: "ignore", detached: true },
+      { stdio: "ignore", windowsHide: true, detached: true },
     );
     const parentPid = parent.pid as number;
     parent.unref();
@@ -709,6 +799,7 @@ function startFakeCallBridge(opts: FakeCallBridgeOptions): Promise<{
     const roots: (string[] | undefined)[] = [];
     const requests: string[] = [];
     const server = createServer((req, res) => {
+      signFakeResponse(req, res);
       const ambient = req.headers[AMBIENT_REQUEST_HEADER] === "1";
       requests.push(`${req.method} ${req.url}${ambient ? " ambient" : ""}`);
       if (req.method === "GET" && req.url?.startsWith("/health")) {
@@ -772,6 +863,7 @@ function startFakeCallBridge(opts: FakeCallBridgeOptions): Promise<{
 describe("callTool pageId routing", () => {
   const savedSession = process.env.CHROME_DEVTOOLS_AXI_SESSION;
   const savedHome = process.env.HOME;
+  const savedUserProfile = process.env.USERPROFILE;
   const savedPort = process.env.CHROME_DEVTOOLS_AXI_PORT;
   let tmpHome = "";
 
@@ -788,18 +880,14 @@ describe("callTool pageId routing", () => {
   ): Promise<void> {
     tmpHome = mkdtempSync(join(tmpdir(), "axi-pageid-"));
     process.env.HOME = tmpHome;
+    process.env.USERPROFILE = tmpHome;
     process.env.CHROME_DEVTOOLS_AXI_SESSION = "pageid-worker";
     const fake = await startFakeCallBridge({
       session: "pageid-worker",
       ...opts,
     });
     process.env.CHROME_DEVTOOLS_AXI_PORT = String(fake.port);
-    const pidFile = resolveSessionPidFile("pageid-worker");
-    mkdirSync(dirname(pidFile), { recursive: true });
-    writeFileSync(
-      pidFile,
-      JSON.stringify({ pid: process.pid, port: fake.port }),
-    );
+    writeBridgeState(fake.port, AUTH_SECRET, "pageid-worker");
     try {
       await run(fake);
     } finally {
@@ -810,6 +898,7 @@ describe("callTool pageId routing", () => {
   afterEach(() => {
     restore("CHROME_DEVTOOLS_AXI_SESSION", savedSession);
     restore("HOME", savedHome);
+    restore("USERPROFILE", savedUserProfile);
     restore("CHROME_DEVTOOLS_AXI_PORT", savedPort);
     if (tmpHome) rmSync(tmpHome, { recursive: true, force: true });
   });
@@ -1343,6 +1432,7 @@ describe("reconnect reporting through the deep health probe", () => {
 
   const savedSession = process.env.CHROME_DEVTOOLS_AXI_SESSION;
   const savedHome = process.env.HOME;
+  const savedUserProfile = process.env.USERPROFILE;
   const savedPort = process.env.CHROME_DEVTOOLS_AXI_PORT;
   let tmpHome = "";
 
@@ -1367,6 +1457,7 @@ describe("reconnect reporting through the deep health probe", () => {
   ): Promise<void> {
     tmpHome = mkdtempSync(join(tmpdir(), "axi-reconnect-cli-"));
     process.env.HOME = tmpHome;
+    process.env.USERPROFILE = tmpHome;
     process.env.CHROME_DEVTOOLS_AXI_SESSION = "reconnect-cli";
     let mcpCalls = 0;
     const client: BridgeClient = {
@@ -1387,16 +1478,19 @@ describe("reconnect reporting through the deep health probe", () => {
       },
       close: async () => {},
     };
-    const server = createBridgeServer(client, "reconnect-cli");
+    const server = createBridgeServer(
+      client,
+      "reconnect-cli",
+      undefined,
+      createBridgeAuth(AUTH_SECRET),
+    );
     try {
       await new Promise<void>((ready) => {
         server.listen(0, "127.0.0.1", ready);
       });
       const { port } = server.address() as AddressInfo;
       process.env.CHROME_DEVTOOLS_AXI_PORT = String(port);
-      const pidFile = resolveSessionPidFile("reconnect-cli");
-      mkdirSync(dirname(pidFile), { recursive: true });
-      writeFileSync(pidFile, JSON.stringify({ pid: process.pid, port }));
+      writeBridgeState(port, AUTH_SECRET, "reconnect-cli");
       await run();
     } finally {
       await new Promise<void>((closed) => server.close(() => closed()));
@@ -1406,6 +1500,7 @@ describe("reconnect reporting through the deep health probe", () => {
   afterEach(() => {
     restore("CHROME_DEVTOOLS_AXI_SESSION", savedSession);
     restore("HOME", savedHome);
+    restore("USERPROFILE", savedUserProfile);
     restore("CHROME_DEVTOOLS_AXI_PORT", savedPort);
     if (tmpHome) rmSync(tmpHome, { recursive: true, force: true });
   });

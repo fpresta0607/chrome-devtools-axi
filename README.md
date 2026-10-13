@@ -438,10 +438,31 @@ Rely on the per-session default ports instead, or set `CHROME_DEVTOOLS_AXI_PORT`
 
 State is stored in `~/.chrome-devtools-axi/` (named sessions nest under `sessions/<name>/`):
 
-| File                  | Purpose                               |
-| --------------------- | ------------------------------------- |
-| `bridge.pid`          | PID and port of the running bridge    |
-| `snapshot-generation` | Counter used to detect stale uid refs |
+| File                  | Purpose                                         |
+| --------------------- | ----------------------------------------------- |
+| `bridge.pid`          | PID, port and private bridge authentication key |
+| `snapshot-generation` | Counter used to detect stale uid refs           |
+
+### Bridge security
+
+`chrome-devtools-axi security --json` reports the package version, platform and supported bridge transport without starting a bridge, browser or login.
+On Windows the transport is `windows-user-v1`.
+Clients must check this capability rather than infer it from a version number.
+
+Every local bridge route requires HMAC authentication, including shallow and deep health, tool discovery and tool calls.
+The CLI authenticates transparently and verifies the response before trusting it.
+Requests bind the method, exact path, body, timestamp, activity header and fresh nonce, with replay rejection and separate request and response MAC domains.
+The key never travels over HTTP and is stored only in the session's protected `bridge.pid` file.
+Windows state directories and token files are checked for current-user ownership and ACL access before any key is written or read.
+SYSTEM and administrators remain outside this boundary, as do hostile processes running as the same user.
+Host and Origin checks remain in place.
+This secures the local AXI bridge, while the attached browser and any remote MCP endpoint require their own access controls.
+
+Legacy bridges cannot be reused.
+After upgrading, explicitly run `chrome-devtools-axi stop`, then `chrome-devtools-axi start` for each session.
+Stopping legacy state requires safe state ACLs and verification that the PID belongs to the current user's AXI bridge.
+Unsafe state or an unverified process fails closed without terminating that process.
+Never share or print `bridge.pid` because it contains the session key.
 
 ### Idle timeout
 

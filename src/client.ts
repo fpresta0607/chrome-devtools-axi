@@ -3,27 +3,34 @@
  */
 
 import { execFileSync, spawn } from "node:child_process";
-import { readFileSync, existsSync } from "node:fs";
+import { existsSync } from "node:fs";
 import { request } from "node:http";
-import { dirname } from "node:path";
+import { dirname, join } from "node:path";
 import { AxiError } from "axi-sdk-js";
 import {
-  AMBIENT_REQUEST_HEADER,
   BRIDGE_PORT_IN_USE_EXIT_CODE,
   PAGE_IDENTITY_CHANGED_ERROR,
   resolveBridgeScript,
 } from "./bridge-script.js";
+import {
+  createAuthHeaders,
+  RESPONSE_PROOF_HEADER,
+  verifyResponse,
+} from "./bridge-auth.js";
+import {
+  readBridgeState,
+  readBridgeStateForStop,
+  removeBridgeState,
+  type BridgeState,
+} from "./bridge-state.js";
+import { verifyWindowsBridgeProcess } from "./windows-acl.js";
 import { needsPageId } from "./pages.js";
 import {
   clearSelectedPageId,
   getSelectedPageId,
   rememberToolRouting,
 } from "./selected-page.js";
-import {
-  resolveSessionName,
-  resolveSessionPidFile,
-  resolveSessionPort,
-} from "./sessions.js";
+import { resolveSessionName, resolveSessionPort } from "./sessions.js";
 
 const DEFAULT_BRIDGE_TIMEOUT_MS = 30_000;
 const MIN_BRIDGE_TIMEOUT_MS = 1_000;
@@ -65,23 +72,12 @@ export class CdpError extends AxiError {
   }
 }
 
-interface PidInfo {
-  pid: number;
-  port: number;
-}
-
-function readPidFile(
-  pidFile: string = resolveSessionPidFile(),
-): PidInfo | null {
-  try {
-    if (!existsSync(pidFile)) return null;
-    const data = JSON.parse(readFileSync(pidFile, "utf-8"));
-    if (typeof data.pid === "number" && typeof data.port === "number") {
-      return data as PidInfo;
-    }
-    return null;
-  } catch {
-    return null;
+class BridgeAuthenticationError extends CdpError {
+  constructor() {
+    super(
+      "Bridge authentication failed. Run stop, then start this session",
+      "BRIDGE_NOT_READY",
+    );
   }
 }
 
@@ -94,64 +90,53 @@ function isProcessAlive(pid: number): boolean {
   }
 }
 
-function httpGet(
+function authenticatedRequest(
   port: number,
   path: string,
-  timeoutMs = 2000,
-  headers: Record<string, string> = {},
+  secret: string,
+  method: "GET" | "POST",
+  payload: string,
+  timeoutMs: number,
+  is_ambient = false,
 ): Promise<string> {
+  const headers = createAuthHeaders(secret, method, path, payload, is_ambient);
   return new Promise((resolve, reject) => {
     const req = request(
       {
         hostname: "127.0.0.1",
         port,
         path,
-        method: "GET",
-        timeout: timeoutMs,
-        headers,
-      },
-      (res) => {
-        let data = "";
-        res.on("data", (chunk) => (data += chunk));
-        res.on("end", () => resolve(data));
-      },
-    );
-    req.on("error", reject);
-    req.on("timeout", () => {
-      req.destroy();
-      reject(new Error("timeout"));
-    });
-    req.end();
-  });
-}
-
-function httpPost(
-  port: number,
-  path: string,
-  body: unknown,
-  timeoutMs = 120_000,
-  headers: Record<string, string> = {},
-): Promise<string> {
-  return new Promise((resolve, reject) => {
-    const payload = JSON.stringify(body);
-    const req = request(
-      {
-        hostname: "127.0.0.1",
-        port,
-        path,
-        method: "POST",
+        method,
         timeout: timeoutMs,
         headers: {
           ...headers,
-          "Content-Type": "application/json",
-          "Content-Length": Buffer.byteLength(payload),
+          ...(method === "POST"
+            ? {
+                "Content-Type": "application/json",
+                "Content-Length": Buffer.byteLength(payload),
+              }
+            : {}),
         },
       },
       (res) => {
         let data = "";
-        res.on("data", (chunk) => (data += chunk));
+        res.setEncoding("utf8");
+        res.on("data", (chunk) => {
+          data += chunk;
+        });
+        res.on("error", reject);
         res.on("end", () => {
-          if (res.statusCode && res.statusCode >= 400) {
+          if (
+            !verifyResponse(
+              secret,
+              headers.authorization,
+              res.statusCode ?? 0,
+              data,
+              res.headers[RESPONSE_PROOF_HEADER],
+            )
+          ) {
+            reject(new BridgeAuthenticationError());
+          } else if (method === "POST" && (res.statusCode ?? 0) >= 400) {
             reject(new Error(data));
           } else {
             resolve(data);
@@ -164,8 +149,7 @@ function httpPost(
       req.destroy();
       reject(new Error("timeout"));
     });
-    req.write(payload);
-    req.end();
+    req.end(payload);
   });
 }
 
@@ -177,8 +161,7 @@ function httpPost(
  * With `expectedSession`, a bridge that reports a *different* session name is
  * treated as unhealthy, so a session never silently reuses another session's
  * bridge after a port collision (two sessions pinned to one port via a global
- * `CHROME_DEVTOOLS_AXI_PORT`). A bridge that omits the field (older version) is
- * accepted, since there is no mismatch to detect.
+ * `CHROME_DEVTOOLS_AXI_PORT`). Legacy or unsigned responses are rejected.
  *
  * With `notice`, a healthy *deep* probe writes the bridge's `pageIdentityChanged`
  * flag into that caller-owned holder (see {@link PageIdentityNotice}).
@@ -195,17 +178,29 @@ export async function checkBridgeHealth(
     expectedSession?: string;
     notice?: PageIdentityNotice;
     ambient?: boolean;
+    secret?: string;
   } = {},
 ): Promise<boolean> {
   try {
     const path = opts.deep ? "/health?deep=1" : "/health";
     const timeoutMs = opts.deep ? DEEP_HEALTH_TIMEOUT_MS : HEALTH_TIMEOUT_MS;
-    const resp = await httpGet(port, path, timeoutMs, ambientHeaders(opts));
+    const state = opts.secret ? null : readBridgeState(opts.expectedSession);
+    const secret =
+      opts.secret ?? (state?.port === port ? state.secret : undefined);
+    if (!secret) return false;
+    const resp = await authenticatedRequest(
+      port,
+      path,
+      secret,
+      "GET",
+      "",
+      timeoutMs,
+      opts.ambient,
+    );
     const data = JSON.parse(resp);
     if (data.status !== "ok") return false;
     if (
       opts.expectedSession !== undefined &&
-      typeof data.session === "string" &&
       data.session !== opts.expectedSession
     ) {
       return false;
@@ -214,7 +209,8 @@ export async function checkBridgeHealth(
       opts.notice.pageIdentityChanged = data.pageIdentityChanged === true;
     }
     return true;
-  } catch {
+  } catch (error) {
+    if (error instanceof BridgeAuthenticationError) throw error;
     return false;
   }
 }
@@ -267,6 +263,10 @@ export async function waitForProcessExit(
 
 function isBridgeProcess(pid: number): boolean {
   try {
+    if (process.platform === "win32") {
+      verifyWindowsBridgeProcess(pid);
+      return true;
+    }
     const command = execFileSync("ps", ["-p", String(pid), "-o", "command="], {
       encoding: "utf-8",
       timeout: 1000,
@@ -290,6 +290,17 @@ export async function terminateBridgeProcess(
 ): Promise<void> {
   if (!isProcessAlive(pid)) return;
   const killProcessGroup = opts.killProcessGroup === true;
+  if (process.platform === "win32" && killProcessGroup) {
+    const systemRoot = process.env.SystemRoot;
+    if (!systemRoot) throw new Error("Missing Windows system directory");
+    execFileSync(
+      join(systemRoot, "System32", "taskkill.exe"),
+      ["/PID", String(pid), "/T", "/F"],
+      { timeout: 10_000, windowsHide: true, stdio: "ignore" },
+    );
+    await waitForProcessExit(pid, 3000);
+    return;
+  }
 
   // Give the bridge a chance to run its own shutdown handler (which kills its
   // process group on `exit`).
@@ -353,11 +364,9 @@ function spawnBridgeProcess(port: number, sessionName: string): SpawnedBridge {
   const script = existsSync(bridgeScript.replace(/\.js$/, ".ts"))
     ? bridgeScript.replace(/\.js$/, ".ts")
     : bridgeScript;
-  const runner = script.endsWith(".ts") ? "tsx" : "node";
-
   const child = spawn(
-    runner === "tsx" ? "npx" : "node",
-    runner === "tsx" ? ["tsx", script] : [script],
+    process.execPath,
+    script.endsWith(".ts") ? ["--import", "tsx", script] : [script],
     {
       stdio: "ignore",
       env: {
@@ -366,6 +375,7 @@ function spawnBridgeProcess(port: number, sessionName: string): SpawnedBridge {
         CHROME_DEVTOOLS_AXI_SESSION: sessionName,
       },
       detached: true,
+      windowsHide: true,
     },
   );
   child.unref();
@@ -478,23 +488,28 @@ export async function ensureBridge(
 ): Promise<number> {
   const sessionName = resolveSessionName();
   const port = resolveSessionPort(sessionName);
-  const pidFile = resolveSessionPidFile(sessionName);
 
   // Check existing bridge via PID file. Use a deep probe so a bridge whose
   // attached CDP target has gone away gets recycled instead of returned.
-  const pidInfo = readPidFile(pidFile);
+  const pidInfo = readBridgeState(sessionName);
   if (pidInfo && isProcessAlive(pidInfo.pid)) {
     if (
       await checkBridgeHealth(pidInfo.port, {
         deep: true,
         expectedSession: sessionName,
         notice,
+        secret: pidInfo.secret,
       })
     ) {
       return pidInfo.port;
     }
+    if (!isBridgeProcess(pidInfo.pid))
+      throw new CdpError(
+        "Refusing to restart an unverified bridge process",
+        "BRIDGE_NOT_READY",
+      );
     await terminateBridgeProcess(pidInfo.pid, {
-      killProcessGroup: isBridgeProcess(pidInfo.pid),
+      killProcessGroup: true,
     });
   }
 
@@ -606,10 +621,6 @@ export async function ensureBridge(
   );
 }
 
-function ambientHeaders(opts: { ambient?: boolean }): Record<string, string> {
-  return opts.ambient ? { [AMBIENT_REQUEST_HEADER]: "1" } : {};
-}
-
 function parseCallResponse(resp: string): string {
   const data = JSON.parse(resp);
   if (data.error) {
@@ -626,12 +637,16 @@ async function postTool(
 ): Promise<string> {
   const body: Record<string, unknown> = { name, args };
   if (opts.roots && opts.roots.length > 0) body.roots = opts.roots;
-  const resp = await httpPost(
+  const state = readBridgeState();
+  if (!state || state.port !== port) throw new BridgeAuthenticationError();
+  const resp = await authenticatedRequest(
     port,
     "/call",
-    body,
-    opts.timeoutMs,
-    ambientHeaders(opts),
+    state.secret,
+    "POST",
+    JSON.stringify(body),
+    opts.timeoutMs ?? 120_000,
+    opts.ambient,
   );
   return parseCallResponse(resp);
 }
@@ -913,25 +928,25 @@ export function mapErrorMessage(message: string): CdpError {
  */
 export async function getSessionSnapshotIfRunning(): Promise<string | null> {
   let sessionName: string;
-  let pidInfo: PidInfo | null;
+  let pidInfo: BridgeState | null;
   try {
     sessionName = resolveSessionName();
-    pidInfo = readPidFile(resolveSessionPidFile(sessionName));
+    pidInfo = readBridgeState(sessionName);
   } catch {
     return null;
   }
   if (!pidInfo || !isProcessAlive(pidInfo.pid)) {
     return null;
   }
-  if (
-    !(await checkBridgeHealth(pidInfo.port, {
-      expectedSession: sessionName,
-      ambient: true,
-    }))
-  ) {
-    return null;
-  }
   try {
+    if (
+      !(await checkBridgeHealth(pidInfo.port, {
+        expectedSession: sessionName,
+        ambient: true,
+      }))
+    ) {
+      return null;
+    }
     const pageId = getSelectedPageId();
     if (pageId === null) return null;
     return await postTool(
@@ -952,12 +967,23 @@ export async function getSessionSnapshotIfRunning(): Promise<string | null> {
  * than orphaned. Resolves once the bridge process is gone.
  */
 export async function stopBridge(): Promise<boolean> {
-  const pidInfo = readPidFile();
+  const pidInfo = readBridgeStateForStop();
   if (!pidInfo) return false;
-  if (!isProcessAlive(pidInfo.pid)) return false;
+  if (!isProcessAlive(pidInfo.pid)) {
+    removeBridgeState(pidInfo.pid);
+    return false;
+  }
+  if (!isBridgeProcess(pidInfo.pid))
+    throw new CdpError(
+      "Refusing to stop an unverified bridge process",
+      "BRIDGE_NOT_READY",
+    );
   await terminateBridgeProcess(pidInfo.pid, {
-    killProcessGroup: isBridgeProcess(pidInfo.pid),
+    killProcessGroup: true,
   });
+  if (isProcessAlive(pidInfo.pid))
+    throw new CdpError("Bridge process did not stop", "BRIDGE_NOT_READY");
+  removeBridgeState(pidInfo.pid);
   clearSelectedPageId();
   return true;
 }

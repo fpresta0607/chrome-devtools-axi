@@ -3,3 +3,6 @@ dist/
 .desloppify/
 .DS_Store
 .no-mistakes/evidence/
+.env
+.env.*
+!.env.example

@@ -75,10 +75,12 @@ async function startBridge(
   const child = spawn(process.execPath, ["--import", "tsx", BRIDGE_SOURCE], {
     cwd: ROOT,
     detached: true,
+    windowsHide: true,
     stdio: ["ignore", "pipe", "pipe"],
     env: {
       ...env,
       HOME: home,
+      USERPROFILE: home,
       CHROME_DEVTOOLS_AXI_SESSION: SESSION,
       CHROME_DEVTOOLS_AXI_PORT: String(await freePort()),
       CHROME_DEVTOOLS_AXI_MCP_PATH: FAKE_MCP,

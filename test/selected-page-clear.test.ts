@@ -40,11 +40,13 @@ vi.mock("node:fs", async (importOriginal) => {
 describe("clearSelectedPageId when the id cannot be removed", () => {
   const savedSession = process.env.CHROME_DEVTOOLS_AXI_SESSION;
   const savedHome = process.env.HOME;
+  const savedUserProfile = process.env.USERPROFILE;
   let tmpHome = "";
 
   beforeEach(() => {
     tmpHome = mkdtempSync(join(tmpdir(), "axi-clear-"));
     process.env.HOME = tmpHome;
+    process.env.USERPROFILE = tmpHome;
     process.env.CHROME_DEVTOOLS_AXI_SESSION = "clear-worker";
   });
 
@@ -57,6 +59,8 @@ describe("clearSelectedPageId when the id cannot be removed", () => {
     }
     if (savedHome === undefined) delete process.env.HOME;
     else process.env.HOME = savedHome;
+    if (savedUserProfile === undefined) delete process.env.USERPROFILE;
+    else process.env.USERPROFILE = savedUserProfile;
     if (tmpHome) rmSync(tmpHome, { recursive: true, force: true });
   });
 
