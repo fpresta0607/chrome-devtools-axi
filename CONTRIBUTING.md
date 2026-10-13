@@ -19,7 +19,7 @@ The release and dependency bots are exempt so their automation keeps working, bu
 
 Fork routing requires `no-mistakes` v1.30.1 or newer.
 
-1. Fork this repo, then clone the parent repo or set your local `origin` back to the parent repo (`git@github.com:fpresta0607/chrome-devtools-axi.git`).
+1. Fork the repo, then clone the parent repo or set your local `origin` back to the parent repo (`git@github.com:kunchenguid/chrome-devtools-axi.git`).
 2. Create a branch and make your changes.
 3. Initialize or refresh the gate with your fork as the push target: `no-mistakes init --fork-url git@github.com:<you>/chrome-devtools-axi.git`.
 4. Commit your changes.
@@ -30,7 +30,7 @@ Fork routing requires `no-mistakes` v1.30.1 or newer.
    ```
 
 6. Run `no-mistakes` to attach to the pipeline, watch findings, and auto-fix or review as needed.
-7. Once the pipeline passes, it pushes your branch to your fork and opens the PR against `fpresta0607/chrome-devtools-axi` for you.
+7. Once the pipeline passes, it pushes your branch to your fork and opens the PR against this parent repo for you.
 
 See the [no-mistakes quick start](https://kunchenguid.github.io/no-mistakes/start-here/quick-start/) for the full first-run walkthrough.
 

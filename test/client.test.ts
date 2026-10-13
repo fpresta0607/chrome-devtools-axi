@@ -987,7 +987,9 @@ describe("ensureBridge early-exit fast-fail", () => {
 
       await expect(
         callTool("new_page", { url: "https://example.com/after-crash" }),
-      ).resolves.toBe("## Pages\n2: https://example.com/after-crash [selected]");
+      ).resolves.toBe(
+        "## Pages\n2: https://example.com/after-crash [selected]",
+      );
       await expect(
         checkBridgeHealth(port, { secret: AUTH_SECRET, deep: true }),
       ).resolves.toBe(true);

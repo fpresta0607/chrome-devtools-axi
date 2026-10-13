@@ -38,9 +38,6 @@ Against raw chrome-devtools-mcp - the very server this CLI wraps - that is 57% f
 
 ## Quick Start
 
-For this fork's bridge hardening, install [from source](#from-source), then verify the installed CLI's [bridge security capability](#bridge-security).
-The skill and npm instructions below describe the upstream distribution.
-
 Install the chrome-devtools-axi skill in the [Agent Skills](https://agentskills.io) format with [`npx skills`](https://github.com/vercel-labs/skills):
 
 ```sh
@@ -110,7 +107,7 @@ Development entrypoints such as `pnpm run dev` and `bin/chrome-devtools-axi.ts` 
 ### From source
 
 ```sh
-git clone https://github.com/fpresta0607/chrome-devtools-axi.git
+git clone https://github.com/kunchenguid/chrome-devtools-axi.git
 cd chrome-devtools-axi
 pnpm install --frozen-lockfile
 pnpm run build
