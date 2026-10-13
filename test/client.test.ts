@@ -1,5 +1,5 @@
 import { describe, expect, it, beforeEach, afterEach, vi } from "vitest";
-import { spawn } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
 import { EventEmitter } from "node:events";
 import {
   createServer,
@@ -10,6 +10,7 @@ import {
 import { AddressInfo, type Socket } from "node:net";
 import {
   chmodSync,
+  existsSync,
   mkdtempSync,
   mkdirSync,
   readFileSync,
@@ -28,6 +29,12 @@ import {
 import { AMBIENT_REQUEST_HEADER } from "../src/bridge-script.js";
 import { createBridgeAuth, RESPONSE_PROOF_HEADER } from "../src/bridge-auth.js";
 import { writeBridgeState } from "../src/bridge-state.js";
+
+vi.mock("node:child_process", async (importOriginal) => {
+  const childProcess =
+    await importOriginal<typeof import("node:child_process")>();
+  return { ...childProcess, execFileSync: vi.fn(childProcess.execFileSync) };
+});
 
 const windowsAcl = vi.hoisted(() => ({
   isWindowsBridgeProcess: vi.fn((_pid: number, _port: number) => false),
@@ -618,33 +625,40 @@ describe("ensureBridge early-exit fast-fail", () => {
     rmSync(tmpHome, { recursive: true, force: true });
   });
 
-  it("reports a port collision after the readiness deadline when no winner publishes state", async () => {
-    process.env.CHROME_DEVTOOLS_AXI_BRIDGE_TIMEOUT_MS = "1000";
-    const start = Date.now();
-    let caught: unknown;
-    try {
-      await ensureBridge(() => {
-        const fake = new EventEmitter();
-        // Emit *after* ensureBridge attaches its exit listener.
-        setImmediate(() =>
-          fake.emit("exit", BRIDGE_PORT_IN_USE_EXIT_CODE, null),
-        );
-        return fake as unknown as SpawnedBridge;
-      });
-    } catch (error) {
-      caught = error;
-    }
-    const elapsed = Date.now() - start;
+  it.each([
+    { timeoutMs: 1000, minimumWaitMs: 1000, maximumWaitMs: 4000 },
+    { timeoutMs: 20000, minimumWaitMs: 5000, maximumWaitMs: 8000 },
+  ])(
+    "bounds the collision grace within a $timeoutMs ms readiness deadline",
+    async ({ timeoutMs, minimumWaitMs, maximumWaitMs }) => {
+      process.env.CHROME_DEVTOOLS_AXI_BRIDGE_TIMEOUT_MS = String(timeoutMs);
+      const start = Date.now();
+      let caught: unknown;
+      try {
+        await ensureBridge(() => {
+          const fake = new EventEmitter();
+          // Emit *after* ensureBridge attaches its exit listener.
+          setImmediate(() =>
+            fake.emit("exit", BRIDGE_PORT_IN_USE_EXIT_CODE, null),
+          );
+          return fake as unknown as SpawnedBridge;
+        });
+      } catch (error) {
+        caught = error;
+      }
+      const elapsed = Date.now() - start;
 
-    expect(caught).toBeInstanceOf(CdpError);
-    expect((caught as CdpError).code).toBe("BRIDGE_NOT_READY");
-    expect((caught as CdpError).message).toContain("before becoming ready");
-    expect((caught as CdpError).suggestions.join("\n")).toContain(
-      "CHROME_DEVTOOLS_AXI_PORT",
-    );
-    expect(elapsed).toBeGreaterThanOrEqual(1000);
-    expect(elapsed).toBeLessThan(5000);
-  });
+      expect(caught).toBeInstanceOf(CdpError);
+      expect((caught as CdpError).code).toBe("BRIDGE_NOT_READY");
+      expect((caught as CdpError).message).toContain("before becoming ready");
+      expect((caught as CdpError).suggestions.join("\n")).toContain(
+        "CHROME_DEVTOOLS_AXI_PORT",
+      );
+      expect(elapsed).toBeGreaterThanOrEqual(minimumWaitMs);
+      expect(elapsed).toBeLessThan(maximumWaitMs);
+    },
+    10_000,
+  );
 
   it.each([
     ["shallow health", "upgrade"],
@@ -956,6 +970,98 @@ describe("ensureBridge early-exit fast-fail", () => {
         await new Promise<void>((closed) => listener.close(() => closed()));
       }
     },
+  );
+
+  it.runIf(process.platform === "win32").each([
+    { action: "restart", has_exited: true },
+    { action: "stop", has_exited: true },
+    { action: "restart", has_exited: false },
+    { action: "stop", has_exited: false },
+  ])(
+    "handles a taskkill failure during $action only if the process exited ($has_exited)",
+    async ({ action, has_exited }) => {
+      const childProcess =
+        await vi.importActual<typeof import("node:child_process")>(
+          "node:child_process",
+        );
+      const child = spawn(
+        process.execPath,
+        ["-e", "setInterval(() => {}, 1000)"],
+        {
+          stdio: "ignore",
+          windowsHide: true,
+        },
+      );
+      await new Promise((started) => child.once("spawn", started));
+      const exited = new Promise((done) => child.once("exit", done));
+      const pid = child.pid!;
+      const session = "early-exit-worker";
+      let is_replacement = false;
+      const listener = createServer((request, response) => {
+        signFakeResponse(request, response);
+        response.statusCode = is_replacement ? 200 : 503;
+        response.end(
+          JSON.stringify({ status: is_replacement ? "ok" : "error", session }),
+        );
+      });
+      await new Promise<void>((ready) =>
+        listener.listen(0, "127.0.0.1", ready),
+      );
+      const port = (listener.address() as AddressInfo).port;
+      process.env.CHROME_DEVTOOLS_AXI_PORT = String(port);
+      writeBridgeState(port, AUTH_SECRET, session, pid);
+      const stateFile = resolveSessionPidFile(session);
+      const state = readFileSync(stateFile, "utf8");
+      const start = vi.fn(() => {
+        is_replacement = true;
+        writeBridgeState(port, AUTH_SECRET, session);
+        return new EventEmitter();
+      });
+      windowsAcl.isWindowsBridgeProcess.mockImplementation(
+        (recordedPid) => recordedPid === pid,
+      );
+      const failure = new Error("taskkill failed");
+      vi.mocked(execFileSync).mockImplementationOnce((file, args, options) => {
+        if (!Array.isArray(args))
+          throw new Error("Expected taskkill arguments");
+        if (has_exited) childProcess.execFileSync(file, args, options);
+        throw failure;
+      });
+
+      try {
+        const operation =
+          action === "restart" ? ensureBridge(start) : stopBridge();
+        if (has_exited) {
+          await expect(operation).resolves.toBe(
+            action === "restart" ? port : true,
+          );
+          await exited;
+          expect(() => process.kill(pid, 0)).toThrow();
+          if (action === "restart") {
+            expect(JSON.parse(readFileSync(stateFile, "utf8")).pid).toBe(
+              process.pid,
+            );
+            expect(start).toHaveBeenCalledOnce();
+          } else {
+            expect(existsSync(stateFile)).toBe(false);
+          }
+        } else {
+          await expect(operation).rejects.toBe(failure);
+          expect(() => process.kill(pid, 0)).not.toThrow();
+          expect(readFileSync(stateFile, "utf8")).toBe(state);
+          expect(start).not.toHaveBeenCalled();
+        }
+      } finally {
+        vi.mocked(execFileSync).mockRestore();
+        windowsAcl.isWindowsBridgeProcess.mockReset();
+        windowsAcl.isWindowsBridgeProcess.mockReturnValue(false);
+        if (child.exitCode === null) child.kill("SIGKILL");
+        await exited;
+        listener.closeAllConnections();
+        await new Promise<void>((closed) => listener.close(() => closed()));
+      }
+    },
+    10_000,
   );
 
   it("reuses a healthy same-session bridge that won the bind race instead of failing on the loser's early exit", async () => {

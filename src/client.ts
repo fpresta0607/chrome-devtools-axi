@@ -35,6 +35,7 @@ import { resolveSessionName, resolveSessionPort } from "./sessions.js";
 
 const DEFAULT_BRIDGE_TIMEOUT_MS = 30_000;
 const MIN_BRIDGE_TIMEOUT_MS = 1_000;
+const BRIDGE_COLLISION_GRACE_MS = 5_000;
 const HEALTH_TIMEOUT_MS = 2_000;
 const DEEP_HEALTH_TIMEOUT_MS = 5_000;
 const MAX_BRIDGE_RESPONSE_BYTES = 64 * 1024 * 1024;
@@ -321,11 +322,15 @@ export async function terminateBridgeProcess(
   if (process.platform === "win32" && killProcessGroup) {
     const systemRoot = process.env.SystemRoot;
     if (!systemRoot) throw new Error("Missing Windows system directory");
-    execFileSync(
-      join(systemRoot, "System32", "taskkill.exe"),
-      ["/PID", String(pid), "/T", "/F"],
-      { timeout: 10_000, windowsHide: true, stdio: "ignore" },
-    );
+    try {
+      execFileSync(
+        join(systemRoot, "System32", "taskkill.exe"),
+        ["/PID", String(pid), "/T", "/F"],
+        { timeout: 10_000, windowsHide: true, stdio: "ignore" },
+      );
+    } catch (error) {
+      if (isProcessAlive(pid)) throw error;
+    }
     await waitForProcessExit(pid, 3000);
     return;
   }
@@ -561,6 +566,8 @@ export async function ensureBridge(
   // Start a new bridge
   const child = spawnBridge(port, sessionName);
 
+  const timeoutMs = resolveBridgeTimeoutMs();
+  let deadline = Date.now() + timeoutMs;
   let childExited = false;
   let exitCode: number | null = null;
   let exitSignal: NodeJS.Signals | null = null;
@@ -568,6 +575,9 @@ export async function ensureBridge(
     childExited = true;
     exitCode = code;
     exitSignal = signal;
+    if (code === BRIDGE_PORT_IN_USE_EXIT_CODE) {
+      deadline = Math.min(deadline, Date.now() + BRIDGE_COLLISION_GRACE_MS);
+    }
   });
 
   // A probe that meets a bridge whose key does not match the session record
@@ -590,8 +600,6 @@ export async function ensureBridge(
   // the failure correctly: shallow-but-no-deep means the MCP server came up
   // but the attached CDP target is dead, vs. nothing-came-up which is the
   // generic startup-timeout case.
-  const timeoutMs = resolveBridgeTimeoutMs();
-  const deadline = Date.now() + timeoutMs;
   let sawShallowReady = false;
   while (Date.now() < deadline) {
     if (await isReady(true)) {
