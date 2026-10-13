@@ -111,6 +111,8 @@ function authenticatedRequest(
         port,
         path,
         method,
+        // Synchronous ACL checks can outlast a pooled socket's idle timeout.
+        agent: false,
         headers: {
           ...headers,
           ...(method === "POST"

@@ -1,6 +1,6 @@
 import { describe, expect, it, beforeEach, afterEach, vi } from "vitest";
 import { execFileSync, spawn } from "node:child_process";
-import { EventEmitter } from "node:events";
+import { EventEmitter, once } from "node:events";
 import {
   createServer,
   type Server,
@@ -914,6 +914,89 @@ describe("ensureBridge early-exit fast-fail", () => {
       if (oldBridge.exitCode === null) oldBridge.kill("SIGKILL");
       successor.closeAllConnections();
       await new Promise<void>((r) => successor.close(() => r()));
+    }
+  }, 20_000);
+
+  it("reopens a page after forced termination and slow state verification", async () => {
+    // The server must keep running while synchronous Windows ACL checks block
+    // the client, just as the detached bridge does in normal CLI operation.
+    const startBridge = () =>
+      spawn(
+        process.execPath,
+        [
+          "--import",
+          "tsx",
+          "--input-type=module",
+          "-e",
+          `
+          import { createBridgeServer } from './src/bridge.ts';
+          import { createBridgeAuth } from './src/bridge-auth.ts';
+          const server = createBridgeServer({
+            listTools: async () => ({ tools: [] }),
+            callTool: async ({ name, arguments: args }) => ({
+              content: [{ type: 'text', text: name === 'new_page'
+                ? '## Pages\\n2: ' + args.url + ' [selected]'
+                : '## Pages\\n1: about:blank [selected]' }],
+            }),
+            close: async () => {},
+          }, 'early-exit-worker', undefined, createBridgeAuth('a'.repeat(64)));
+          server.listen(Number(process.env.CHROME_DEVTOOLS_AXI_PORT ?? 0), '127.0.0.1', () => {
+            console.log(server.address().port);
+          });
+          `,
+        ],
+        { stdio: ["ignore", "pipe", "inherit"], windowsHide: true },
+      );
+    const original = startBridge();
+    const originalExited = once(original, "exit");
+    let replacement: ReturnType<typeof startBridge> | undefined;
+    let replacementExited: Promise<unknown> | undefined;
+    const platform = vi.spyOn(process, "platform", "get");
+    try {
+      const [output] = await once(original.stdout, "data");
+      const port = Number(String(output).trim());
+      if (!original.pid) throw new Error("Bridge fixture did not start");
+      platform.mockReturnValue("win32");
+      writeBridgeState(port, AUTH_SECRET, "early-exit-worker", original.pid);
+      setSelectedPageId(7);
+      original.kill("SIGKILL");
+      await originalExited;
+      process.env.CHROME_DEVTOOLS_AXI_PORT = String(port);
+
+      await expect(
+        ensureBridge(() => {
+          replacement = startBridge();
+          replacementExited = once(replacement, "exit");
+          const pid = replacement.pid;
+          if (!pid) throw new Error("Replacement bridge did not start");
+          replacement.stdout.once("data", () => {
+            writeBridgeState(port, AUTH_SECRET, "early-exit-worker", pid);
+          });
+          return replacement;
+        }),
+      ).resolves.toBe(port);
+      await expect(callTool("take_snapshot")).rejects.toMatchObject({
+        code: "BROWSER_ERROR",
+        message: "No page is currently selected",
+      });
+      windowsAcl.verifyWindowsState
+        .mockImplementationOnce(() => {})
+        .mockImplementationOnce(() => {
+          Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 7_000);
+        });
+
+      await expect(
+        callTool("new_page", { url: "https://example.com/after-crash" }),
+      ).resolves.toBe("## Pages\n2: https://example.com/after-crash [selected]");
+      await expect(
+        checkBridgeHealth(port, { secret: AUTH_SECRET, deep: true }),
+      ).resolves.toBe(true);
+    } finally {
+      windowsAcl.verifyWindowsState.mockReset();
+      platform.mockRestore();
+      original.kill("SIGKILL");
+      replacement?.kill("SIGKILL");
+      await Promise.all([originalExited, replacementExited]);
     }
   }, 20_000);
 
