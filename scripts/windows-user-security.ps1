@@ -85,20 +85,20 @@ try {
         Write-Host "$role proof pid=$($process.Id) sid=$($users[$userIndex].SID.Value)"
         if ($role -eq 'owner') {
             $readyFile = Join-Path $proofRoot 'owner-output\ready.json'
-            $deadline = [DateTime]::UtcNow.AddSeconds(60)
+            $deadline = [DateTime]::UtcNow.AddSeconds(180)
             while (-not (Test-Path -LiteralPath $readyFile)) {
                 if ($process.HasExited) { throw 'Owner fixture exited before readiness.' }
                 if ([DateTime]::UtcNow -ge $deadline) { throw 'Owner fixture readiness timed out.' }
                 Start-Sleep -Milliseconds 200
             }
         } else {
-            Wait-ProofProcess $process 60000
+            Wait-ProofProcess $process 120000
         }
     }
     Set-Content -LiteralPath (Join-Path $proofRoot 'finish') -Value 'finish'
-    Wait-ProofProcess $processes[0] 15000
+    Wait-ProofProcess $processes[0] 120000
     $result = Get-Content -LiteralPath (Join-Path $proofRoot 'alternate-output\result.json') -Raw | ConvertFrom-Json
-    if ($result.secretReadsDenied -ne 2 -or $result.observations.Count -ne 16) {
+    if ($result.secretReadsDenied -ne 3 -or $result.stateWritesDenied -ne 15 -or $result.observations.Count -ne 24) {
         throw 'The alternate-user proof did not complete every assertion.'
     }
     $result | ConvertTo-Json -Depth 5
@@ -111,9 +111,13 @@ try {
         $childProcessIds = @(Get-Content -LiteralPath $childrenFile -Raw | ConvertFrom-Json)
     }
     $fixtureProcessIds = @($processes | ForEach-Object { $_.Id })
+    # A recorded child counts only while its parent is a fixture or another
+    # recorded child (the CLI that spawned the detached bridge), so a reused
+    # pid is never ended.
+    $recordedProcessIds = $fixtureProcessIds + $childProcessIds
     $childProcessIds = @(foreach ($childProcessId in $childProcessIds) {
         $childProcess = Get-CimInstance Win32_Process -Filter "ProcessId = $childProcessId"
-        if ($childProcess -and $childProcess.ParentProcessId -in $fixtureProcessIds) {
+        if ($childProcess -and $childProcess.ParentProcessId -in $recordedProcessIds) {
             $childProcessId
         }
     })
@@ -167,5 +171,5 @@ try {
     if ($cleanupErrors.Count -gt 0) { throw "Proof cleanup had $($cleanupErrors.Count) failures." }
 }
 if ($isProofPassed) {
-    Write-Host 'PASS: two standard Windows users, two protected sessions, owner CLI, all bridge routes, and cleanup.'
+    Write-Host 'PASS: two standard Windows users, three protected sessions including a real bridge, owner CLI, all bridge routes, state changes, and cleanup.'
 }

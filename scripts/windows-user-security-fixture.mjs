@@ -4,13 +4,16 @@ import { randomBytes } from "node:crypto";
 import { once } from "node:events";
 import {
   existsSync,
+  readdirSync,
   readFileSync,
   renameSync,
   rmSync,
+  unlinkSync,
   writeFileSync,
 } from "node:fs";
+import { createServer } from "node:net";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import { pathToFileURL } from "node:url";
 
@@ -20,6 +23,7 @@ const READY_FILE = join(proofRoot, "owner-output", "ready.json");
 const STOP_FILE = join(proofRoot, "finish");
 const PAGE_URL = "https://windows-user-proof.invalid/";
 const CHILDREN_FILE = join(proofRoot, "owner-output", "children.json");
+const REAL_SESSION = "real-bridge";
 const childPids = [];
 const bridgeSecrets = [];
 const ROUTES = [
@@ -70,6 +74,30 @@ async function request(port, method, path, body, headers = {}) {
   return { status: response.status, text: await response.text() };
 }
 
+function isAlive(pid) {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function freePort() {
+  return new Promise((resolve, reject) => {
+    const probe = createServer();
+    probe.once("error", reject);
+    probe.listen(0, "127.0.0.1", () => {
+      const { port } = probe.address();
+      probe.close(() => resolve(port));
+    });
+  });
+}
+
+function isAccessDenied(error) {
+  return error.code === "EACCES" || error.code === "EPERM";
+}
+
 function writeJson(file, value) {
   writeFileSync(`${file}.tmp`, JSON.stringify(value));
   renameSync(`${file}.tmp`, file);
@@ -94,7 +122,7 @@ function runCli(args, environment = {}) {
     });
     let stdout = "";
     let stderr = "";
-    const timer = setTimeout(() => child.kill(), 15_000);
+    const timer = setTimeout(() => child.kill(), 60_000);
     child.stdout.on("data", (chunk) => (stdout += chunk));
     child.stderr.on("data", (chunk) => (stderr += chunk));
     child.once("error", (error) => {
@@ -205,12 +233,60 @@ async function proveOwner() {
       }
       sessions.push({ session, port, secretFile });
     }
+    const realEnvironment = {
+      CHROME_DEVTOOLS_AXI_SESSION: REAL_SESSION,
+      CHROME_DEVTOOLS_AXI_PORT: String(await freePort()),
+      CHROME_DEVTOOLS_AXI_MCP_PATH: join(
+        repository,
+        "test",
+        "fixtures",
+        "fake-mcp-server.mjs",
+      ),
+    };
+    const started = await runCli(["start"], realEnvironment);
+    const realState = await readBridgeState(REAL_SESSION);
+    childPids.push(realState.pid);
+    writeJson(CHILDREN_FILE, childPids);
+    bridgeSecrets.push(realState.secret);
+    console.log(`owner bridge pid=${realState.pid}`);
+    assert.equal(
+      realState.port,
+      Number(realEnvironment.CHROME_DEVTOOLS_AXI_PORT),
+    );
+    const realPages = await runCli(["pages"], realEnvironment);
+    assert.ok(
+      realPages.stdout.includes("about:blank"),
+      "CLI did not reach the real bridge",
+    );
+    for (const value of bridgeSecrets) {
+      assert.ok(
+        ![started, realPages].some(({ stdout, stderr }) =>
+          `${stdout}${stderr}`.includes(value),
+        ),
+        "CLI output leaked a secret",
+      );
+    }
+    sessions.push({
+      session: REAL_SESSION,
+      port: realState.port,
+      secretFile: resolveSessionPidFile(REAL_SESSION),
+    });
     const baselineCalls = toolCalls;
     writeJson(READY_FILE, { pid: process.pid, sid: expectedSid, sessions });
     const deadline = Date.now() + 120_000;
     while (!existsSync(STOP_FILE) && Date.now() < deadline) await delay(200);
     assert.ok(existsSync(STOP_FILE), "Timed out waiting for alternate user");
     assert.equal(toolCalls, baselineCalls, "Unauthorized request reached MCP");
+    const stopped = await runCli(["stop"], realEnvironment);
+    assert.ok(
+      stopped.stdout.includes("stopped") && !stopped.stdout.includes("no-op"),
+      "CLI did not stop the real bridge",
+    );
+    assert.ok(
+      !existsSync(resolveSessionPidFile(REAL_SESSION)),
+      "Stopped bridge left its key behind",
+    );
+    assert.ok(!isAlive(realState.pid), "Real bridge survived stop");
     console.log(
       "Owner CLI and all authenticated routes passed for both sessions",
     );
@@ -236,12 +312,32 @@ async function proveAlternate() {
     "control",
   );
   const observations = [];
+  let stateWritesDenied = 0;
   for (const { session, port, secretFile } of ready.sessions) {
     assert.throws(
       () => readFileSync(secretFile, "utf8"),
-      (error) => error.code === "EACCES" || error.code === "EPERM",
+      isAccessDenied,
       `Alternate user must be denied reading ${session} secret`,
     );
+    const directory = dirname(secretFile);
+    for (const [attempt, operation] of [
+      ["list", () => readdirSync(directory)],
+      [
+        "create",
+        () =>
+          writeFileSync(join(directory, "planted.json"), "{}", { flag: "wx" }),
+      ],
+      ["overwrite", () => writeFileSync(secretFile, "{}")],
+      ["delete", () => unlinkSync(secretFile)],
+      ["rename", () => renameSync(secretFile, `${secretFile}.moved`)],
+    ]) {
+      assert.throws(
+        operation,
+        isAccessDenied,
+        `Alternate user must be denied ${attempt} on ${session} state`,
+      );
+      stateWritesDenied++;
+    }
     for (const [method, path, body] of ROUTES) {
       for (const credential of ["absent", "wrong"]) {
         const headers =
@@ -276,11 +372,12 @@ async function proveAlternate() {
   }
   writeJson(join(proofRoot, "alternate-output", "result.json"), {
     sid: expectedSid,
-    secretReadsDenied: 2,
+    secretReadsDenied: ready.sessions.length,
+    stateWritesDenied,
     observations,
   });
   console.log(
-    "Alternate non-admin user denied both secrets and all 16 HTTP requests",
+    `Alternate non-admin user denied ${ready.sessions.length} secrets, ${stateWritesDenied} state changes and ${observations.length} HTTP requests`,
   );
 }
 
