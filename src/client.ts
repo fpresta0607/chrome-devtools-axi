@@ -513,17 +513,24 @@ export async function ensureBridge(
   const pidInfo = readBridgeState(sessionName);
   if (pidInfo) {
     if (isProcessAlive(pidInfo.pid)) {
-      if (
-        await checkBridgeHealth(pidInfo.port, {
-          deep: true,
-          expectedSession: sessionName,
-          notice,
-          secret: pidInfo.secret,
-        })
-      ) {
-        return pidInfo.port;
+      let authenticationError: BridgeAuthenticationError | undefined;
+      try {
+        if (
+          await checkBridgeHealth(pidInfo.port, {
+            deep: true,
+            expectedSession: sessionName,
+            notice,
+            secret: pidInfo.secret,
+          })
+        ) {
+          return pidInfo.port;
+        }
+      } catch (error) {
+        if (!(error instanceof BridgeAuthenticationError)) throw error;
+        authenticationError = error;
       }
       if (isBridgeProcess(pidInfo.pid, pidInfo.port)) {
+        if (authenticationError) throw authenticationError;
         await terminateBridgeProcess(pidInfo.pid, { killProcessGroup: true });
         if (isProcessAlive(pidInfo.pid))
           throw new CdpError("Bridge process did not stop", "BRIDGE_NOT_READY");
@@ -990,7 +997,7 @@ export async function getSessionSnapshotIfRunning(): Promise<string | null> {
  * than orphaned. Resolves once the bridge process is gone.
  */
 export async function stopBridge(): Promise<boolean> {
-  const pidInfo = readBridgeStateForStop();
+  const pidInfo = readBridgeStateForStop(resolveSessionName(), true);
   if (!pidInfo) return false;
   if (
     !isProcessAlive(pidInfo.pid) ||

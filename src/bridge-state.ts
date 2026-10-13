@@ -33,6 +33,9 @@ export interface BridgeState {
   bridge_transport: typeof BRIDGE_TRANSPORT;
 }
 
+const UNSAFE_STATE_MESSAGE =
+  "Unsafe bridge state permissions. Run stop, then start this session";
+
 function stateDirectories(sessionName: string): string[] {
   validateSessionName(sessionName);
   const root = resolveSessionStateDir(DEFAULT_SESSION_NAME);
@@ -41,16 +44,25 @@ function stateDirectories(sessionName: string): string[] {
     : [root, join(root, "sessions"), resolveSessionStateDir(sessionName)];
 }
 
-function verifyPosixPath(path: string, is_directory: boolean): void {
+function verifyPosixPath(
+  path: string,
+  is_directory: boolean,
+  should_prepare = false,
+): void {
   const info = lstatSync(path);
   if (
     info.isSymbolicLink() ||
     (is_directory ? !info.isDirectory() : !info.isFile()) ||
     info.uid !== process.getuid?.() ||
-    (info.mode & 0o077) !== 0 ||
     (!is_directory && info.nlink !== 1)
   ) {
-    throw new Error("Unsafe bridge state permissions");
+    throw new Error(UNSAFE_STATE_MESSAGE);
+  }
+  if (should_prepare) {
+    chmodSync(path, is_directory ? 0o700 : 0o600);
+    verifyPosixPath(path, is_directory);
+  } else if ((info.mode & 0o077) !== 0) {
+    throw new Error(UNSAFE_STATE_MESSAGE);
   }
 }
 
@@ -61,29 +73,32 @@ export function prepareSessionState(sessionName = resolveSessionName()): void {
     return;
   }
   for (const path of directories) {
-    if (!existsSync(path)) mkdirSync(path, { mode: 0o700 });
-    const info = lstatSync(path);
-    if (
-      !info.isDirectory() ||
-      info.isSymbolicLink() ||
-      info.uid !== process.getuid?.()
-    )
-      throw new Error("Unsafe bridge state directory");
-    chmodSync(path, 0o700);
-    verifyPosixPath(path, true);
+    try {
+      mkdirSync(path, { mode: 0o700 });
+    } catch (error) {
+      if (
+        !(error instanceof Error) ||
+        !("code" in error) ||
+        error.code !== "EEXIST"
+      )
+        throw error;
+    }
+    verifyPosixPath(path, true, true);
   }
 }
 
 function readState(sessionName: string): Record<string, unknown> | null {
   const directories = stateDirectories(sessionName);
+  const path = resolveSessionPidFile(sessionName);
+  if (!existsSync(path)) return null;
   for (const path of directories) {
     if (!existsSync(path)) return null;
     if (process.platform !== "win32") verifyPosixPath(path, true);
   }
-  const path = resolveSessionPidFile(sessionName);
-  if (!existsSync(path)) return null;
-  if (process.platform === "win32") verifyWindowsState(directories, path);
-  else verifyPosixPath(path, false);
+  if (process.platform === "win32") {
+    if (lstatSync(path).nlink !== 1) throw new Error(UNSAFE_STATE_MESSAGE);
+    verifyWindowsState(directories, path);
+  } else verifyPosixPath(path, false);
   try {
     const data: unknown = JSON.parse(readFileSync(path, "utf8"));
     if (data === null || typeof data !== "object" || Array.isArray(data))
@@ -98,7 +113,21 @@ function readState(sessionName: string): Record<string, unknown> | null {
 
 export function readBridgeStateForStop(
   sessionName = resolveSessionName(),
+  should_migrate = false,
 ): { pid: number; port: number } | null {
+  if (should_migrate) {
+    const directories = stateDirectories(sessionName);
+    const path = resolveSessionPidFile(sessionName);
+    if (!existsSync(path)) return null;
+    if (process.platform === "win32") {
+      if (lstatSync(path).nlink !== 1) throw new Error(UNSAFE_STATE_MESSAGE);
+      secureWindowsPaths(directories, "prepare-directory", path);
+    } else {
+      for (const directory of directories)
+        verifyPosixPath(directory, true, true);
+      verifyPosixPath(path, false, true);
+    }
+  }
   const data = readState(sessionName);
   if (!data) return null;
   if (

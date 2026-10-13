@@ -1,6 +1,7 @@
 import { spawn, type ChildProcess } from "node:child_process";
+import { once } from "node:events";
 import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
-import { createServer, type AddressInfo } from "node:net";
+import { createConnection, createServer, type AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -171,6 +172,45 @@ describe("bridge process lifecycle", () => {
     ).resolves.toBe(0);
     expect(existsSync(running.pidFile)).toBe(false);
   }, 30_000);
+
+  it.each(["unfinished body", "unfinished headers", "idle socket"])(
+    "exits and stops MCP despite an unauthenticated %s",
+    async (connection) => {
+      const running = await startBridge({
+        CHROME_DEVTOOLS_AXI_IDLE_TIMEOUT_MS: "1000",
+      });
+      const { port } = JSON.parse(readFileSync(running.pidFile, "utf8"));
+      const socket = createConnection({ host: "127.0.0.1", port });
+      socket.on("error", () => {});
+      try {
+        await once(socket, "connect");
+        if (connection === "unfinished body") {
+          socket.write(
+            `POST /call HTTP/1.1\r\nHost: 127.0.0.1:${port}\r\nAuthorization: AXI-HMAC forged\r\nContent-Length: 1024\r\n\r\n{`,
+          );
+        } else if (connection === "unfinished headers") {
+          socket.write(`POST /call HTTP/1.1\r\nHost: 127.0.0.1:${port}\r\n`);
+        }
+
+        await expect(
+          withTimeout(
+            running.exited,
+            8_000,
+            "idle bridge exit with a peer connected",
+          ),
+        ).resolves.toBe(0);
+        expect(existsSync(running.pidFile)).toBe(false);
+        const deadline = Date.now() + 5_000;
+        while (isAlive(running.mcpPid) && Date.now() < deadline) {
+          await new Promise((settle) => setTimeout(settle, 50));
+        }
+        expect(isAlive(running.mcpPid)).toBe(false);
+      } finally {
+        socket.destroy();
+      }
+    },
+    30_000,
+  );
 
   it("cleans up and rotates the authentication key when the same session restarts", async () => {
     const original = await startBridge();

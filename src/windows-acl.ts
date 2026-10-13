@@ -3,11 +3,15 @@ import { join } from "node:path";
 
 const ACL_SCRIPT = String.raw`
 $ErrorActionPreference = 'Stop'
-function Assert-Protected([string]$path, [bool]$isDirectory, $sid) {
+function Assert-Owned([string]$path, [bool]$isDirectory, $sid) {
   $item = Get-Item -Force -LiteralPath $path
   if (($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0 -or $item.PSIsContainer -ne $isDirectory) { throw 'Denied' }
   $security = Get-Acl -LiteralPath $path
   if ($security.GetOwner([System.Security.Principal.SecurityIdentifier]).Value -ne $sid.Value) { throw 'Denied' }
+  return $security
+}
+function Assert-Protected([string]$path, [bool]$isDirectory, $sid) {
+  $security = Assert-Owned $path $isDirectory $sid
   $allowed = @($sid.Value, 'S-1-5-18', 'S-1-5-32-544')
   $rules = $security.GetAccessRules($true, $true, [System.Security.Principal.SecurityIdentifier])
   if ($rules.Count -eq 0) { throw 'Denied' }
@@ -24,14 +28,21 @@ try {
     $target = Get-CimInstance Win32_Process -Filter ('ProcessId = ' + $processId)
     if ($null -ne $target) {
       $owner = Invoke-CimMethod -InputObject $target -MethodName GetOwnerSid
-      $listeners = @(Get-CimInstance -Namespace root/StandardCimv2 -ClassName MSFT_NetTCPConnection -Filter ('State = 2 AND LocalPort = ' + [int]$request.port + ' AND OwningProcess = ' + $processId) | Where-Object { $_.LocalAddress -eq '127.0.0.1' })
-      $isBridge = $owner.ReturnValue -eq 0 -and $owner.Sid -eq $sid.Value -and
-        [System.IO.Path]::GetFileName([string]$target.ExecutablePath) -ieq 'node.exe' -and
-        $target.CommandLine -match '(?i)(?:^|[\\/\s"''])chrome-devtools-axi-bridge\.(?:js|ts)(?:["''\s]|$)' -and
-        $listeners.Count -gt 0
+      if ($owner.ReturnValue -ne 0 -or [string]::IsNullOrWhiteSpace($owner.Sid)) { throw 'Denied' }
+      if ($owner.Sid -eq $sid.Value) {
+        if ([string]::IsNullOrWhiteSpace($target.ExecutablePath) -or [string]::IsNullOrWhiteSpace($target.CommandLine)) { throw 'Denied' }
+        $listeners = @(Get-CimInstance -Namespace root/StandardCimv2 -ClassName MSFT_NetTCPConnection -Filter ('State = 2 AND LocalPort = ' + [int]$request.port + ' AND OwningProcess = ' + $processId) | Where-Object { $_.LocalAddress -eq '127.0.0.1' })
+        $isBridge = [System.IO.Path]::GetFileName([string]$target.ExecutablePath) -ieq 'node.exe' -and
+          $target.CommandLine -match '(?i)(?:^|[\\/\s"''])chrome-devtools-axi-bridge\.(?:js|ts)(?:["''\s]|$)' -and
+          $listeners.Count -gt 0
+      }
     }
     [Console]::Out.Write($(if ($isBridge) { 'bridge' } else { 'other' }))
     exit 0
+  }
+  if ($request.file -and $request.mode -eq 'prepare-directory') {
+    foreach ($path in $request.paths) { $null = Assert-Owned $path $true $sid }
+    $null = Assert-Owned $request.file $false $sid
   }
   foreach ($path in $request.paths) {
     if ($request.mode -eq 'prepare-directory') {
@@ -41,10 +52,7 @@ try {
       $rule = New-Object System.Security.AccessControl.FileSystemAccessRule($sid, 'FullControl', 'ContainerInherit, ObjectInherit', 'None', 'Allow')
       $security.AddAccessRule($rule)
       if (Test-Path -LiteralPath $path) {
-        $item = Get-Item -Force -LiteralPath $path
-        if (($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0 -or -not $item.PSIsContainer) { throw 'Denied' }
-        $existing = Get-Acl -LiteralPath $path
-        if ($existing.GetOwner([System.Security.Principal.SecurityIdentifier]).Value -ne $sid.Value) { throw 'Denied' }
+        $null = Assert-Owned $path $true $sid
         [System.IO.Directory]::SetAccessControl($path, $security)
       } else {
         [void][System.IO.Directory]::CreateDirectory($path, $security)
@@ -52,7 +60,18 @@ try {
     }
     Assert-Protected $path ($request.mode -ne 'verify-file') $sid
   }
-  if ($request.file) { Assert-Protected $request.file $false $sid }
+  if ($request.file) {
+    if ($request.mode -eq 'prepare-directory') {
+      $null = Assert-Owned $request.file $false $sid
+      $security = New-Object System.Security.AccessControl.FileSecurity
+      $security.SetOwner($sid)
+      $security.SetAccessRuleProtection($true, $false)
+      $rule = New-Object System.Security.AccessControl.FileSystemAccessRule($sid, 'FullControl', 'Allow')
+      $security.AddAccessRule($rule)
+      [System.IO.File]::SetAccessControl($request.file, $security)
+    }
+    Assert-Protected $request.file $false $sid
+  }
   [Console]::Out.Write('ok')
 } catch {
   [Console]::Error.Write('Windows bridge access verification failed')
@@ -97,7 +116,7 @@ function runWindowsVerification(input: object): string {
     ).trim();
   } catch {
     throw new Error(
-      "Windows bridge ACL or process ownership verification failed",
+      "Windows bridge ACL or process ownership verification failed. Run stop, then start this session",
     );
   }
 }
@@ -105,7 +124,7 @@ function runWindowsVerification(input: object): string {
 function verifyWindowsAccess(input: object): void {
   if (runWindowsVerification(input) !== "ok")
     throw new Error(
-      "Windows bridge ACL or process ownership verification failed",
+      "Windows bridge ACL or process ownership verification failed. Run stop, then start this session",
     );
 }
 
@@ -119,8 +138,9 @@ export function secureWindowsPath(
 export function secureWindowsPaths(
   paths: string[],
   mode: "prepare-directory" | "verify-directory" | "verify-file",
+  file?: string,
 ): void {
-  verifyWindowsAccess({ paths, mode });
+  verifyWindowsAccess({ paths, mode, file });
 }
 
 /** Verify a session's state directories and its token file in one launch. */
@@ -137,7 +157,7 @@ export function isWindowsBridgeProcess(pid: number, port: number): boolean {
   const verdict = runWindowsVerification({ pid, port, mode: "verify-process" });
   if (verdict !== "bridge" && verdict !== "other")
     throw new Error(
-      "Windows bridge ACL or process ownership verification failed",
+      "Windows bridge ACL or process ownership verification failed. Run stop, then start this session",
     );
   return verdict === "bridge";
 }

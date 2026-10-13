@@ -1,10 +1,14 @@
 import {
+  chmodSync,
   existsSync,
+  linkSync,
+  lstatSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
   readdirSync,
   rmSync,
+  symlinkSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -20,6 +24,10 @@ vi.mock("node:os", async (importOriginal) => ({
   ...(await importOriginal<typeof import("node:os")>()),
   homedir: () => home.value,
 }));
+vi.mock("node:fs", async (importOriginal) => {
+  const filesystem = await importOriginal<typeof import("node:fs")>();
+  return { ...filesystem, mkdirSync: vi.fn(filesystem.mkdirSync) };
+});
 vi.mock("../src/windows-acl.js", () => ({
   secureWindowsPath,
   secureWindowsPaths: (paths: string[], mode: string) =>
@@ -33,9 +41,13 @@ vi.mock("../src/windows-acl.js", () => ({
 import {
   prepareSessionState,
   readBridgeState,
+  readBridgeStateForStop,
   writeBridgeState,
 } from "../src/bridge-state.js";
-import { resolveSessionPidFile } from "../src/sessions.js";
+import {
+  resolveSessionPidFile,
+  resolveSessionStateDir,
+} from "../src/sessions.js";
 import { removePidFile } from "../src/bridge.js";
 
 describe("protected bridge state", () => {
@@ -47,7 +59,10 @@ describe("protected bridge state", () => {
     });
   });
 
-  afterEach(() => rmSync(home.value, { recursive: true, force: true }));
+  afterEach(() => {
+    vi.mocked(mkdirSync).mockRestore();
+    rmSync(home.value, { recursive: true, force: true });
+  });
 
   it.each(["default", "worker-1"])(
     "persists and cleans up authenticated state for %s",
@@ -100,6 +115,116 @@ describe("protected bridge state", () => {
 
     expect(() => readBridgeState("default")).toThrow(
       /authenticated bridge state/i,
+    );
+  });
+
+  it.each(["default", "worker-1"])(
+    "rejects multiply linked state during stop migration for %s",
+    (session) => {
+      writeBridgeState(9224, "a".repeat(64), session);
+      const stateFile = resolveSessionPidFile(session);
+      linkSync(stateFile, join(home.value, "linked-state"));
+
+      expect(() => readBridgeStateForStop(session, true)).toThrow(/Unsafe/);
+      expect(existsSync(stateFile)).toBe(true);
+      expect(lstatSync(stateFile).nlink).toBe(2);
+    },
+  );
+
+  describe.runIf(process.platform !== "win32")("POSIX state migration", () => {
+    it.each(["default", "worker-1"])(
+      "repairs legacy directories on a fresh start for %s",
+      (session) => {
+        const root = resolveSessionStateDir("default");
+        const directories =
+          session === "default"
+            ? [root]
+            : [root, join(root, "sessions"), resolveSessionStateDir(session)];
+        for (const directory of directories) {
+          mkdirSync(directory, { mode: 0o755 });
+          chmodSync(directory, 0o755);
+        }
+
+        expect(readBridgeState(session)).toBeNull();
+        writeBridgeState(9224, "a".repeat(64), session);
+
+        expect(readBridgeState(session)?.secret).toBe("a".repeat(64));
+        for (const directory of directories) {
+          expect(lstatSync(directory).mode & 0o777).toBe(0o700);
+        }
+      },
+    );
+
+    it.each(["default", "worker-1"])(
+      "tightens owned legacy directories and file before stop reads %s",
+      (session) => {
+        writeBridgeState(9224, "a".repeat(64), session);
+        const root = resolveSessionStateDir("default");
+        const directories =
+          session === "default"
+            ? [root]
+            : [root, join(root, "sessions"), resolveSessionStateDir(session)];
+        for (const directory of directories) chmodSync(directory, 0o755);
+        const stateFile = resolveSessionPidFile(session);
+        chmodSync(stateFile, 0o644);
+
+        expect(() => readBridgeState(session)).toThrow(/Run stop, then start/);
+        expect(readBridgeStateForStop(session, true)).toEqual({
+          pid: process.pid,
+          port: 9224,
+        });
+
+        for (const directory of directories) {
+          expect(lstatSync(directory).mode & 0o777).toBe(0o700);
+        }
+        expect(lstatSync(stateFile).mode & 0o777).toBe(0o600);
+        expect(readBridgeState(session)?.secret).toBe("a".repeat(64));
+      },
+    );
+
+    it("does not migrate a symlinked state file", () => {
+      prepareSessionState("default");
+      const target = join(home.value, "other-state");
+      writeFileSync(target, JSON.stringify({ pid: process.pid, port: 9224 }));
+      chmodSync(target, 0o644);
+      symlinkSync(target, resolveSessionPidFile("default"));
+
+      expect(() => readBridgeStateForStop("default", true)).toThrow(/Unsafe/);
+      expect(lstatSync(target).mode & 0o777).toBe(0o644);
+    });
+
+    it.each([0, 1, 2])(
+      "tolerates concurrent creation of state directory %i and enforces permissions",
+      async (index) => {
+        const filesystem =
+          await vi.importActual<typeof import("node:fs")>("node:fs");
+        const root = resolveSessionStateDir("default");
+        const directories = [
+          root,
+          join(root, "sessions"),
+          resolveSessionStateDir("worker-1"),
+        ];
+        let has_raced = false;
+        vi.mocked(mkdirSync).mockImplementation((path, options) => {
+          if (path === directories[index]) {
+            has_raced = true;
+            filesystem.mkdirSync(path, { mode: 0o755 });
+            chmodSync(path, 0o755);
+            throw Object.assign(new Error("Already exists"), {
+              code: "EEXIST",
+            });
+          }
+          return filesystem.mkdirSync(path, options);
+        });
+
+        writeBridgeState(9224, "a".repeat(64), "worker-1");
+
+        expect(has_raced).toBe(true);
+        expect(readBridgeState("worker-1")?.secret).toBe("a".repeat(64));
+        for (const directory of directories) {
+          expect(lstatSync(directory).mode & 0o777).toBe(0o700);
+        }
+      },
     );
   });
 

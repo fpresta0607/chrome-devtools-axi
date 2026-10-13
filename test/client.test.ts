@@ -404,8 +404,10 @@ describe("checkBridgeHealth (deep probe)", () => {
 
   it("returns false when nothing is listening on the port", async () => {
     // Port 1 is privileged and unbound — connection should be refused immediately.
-    expect(await checkBridgeHealth(1)).toBe(false);
-    expect(await checkBridgeHealth(1, { deep: true })).toBe(false);
+    expect(await checkBridgeHealth(1, { secret: AUTH_SECRET })).toBe(false);
+    expect(
+      await checkBridgeHealth(1, { secret: AUTH_SECRET, deep: true }),
+    ).toBe(false);
   });
 
   it("treats a session-name mismatch as unhealthy (another session's bridge)", async () => {
@@ -730,6 +732,38 @@ describe("ensureBridge early-exit fast-fail", () => {
       windowsAcl.verifyWindowsState.mockReset();
     }
   }, 25_000);
+
+  it.runIf(process.platform === "win32").each(["restart", "stop"])(
+    "preserves state when %s cannot verify the recorded process",
+    async (action) => {
+      const listener = createServer((_request, response) =>
+        response.end("unsigned"),
+      );
+      await new Promise<void>((ready) =>
+        listener.listen(0, "127.0.0.1", ready),
+      );
+      const port = (listener.address() as AddressInfo).port;
+      writeBridgeState(port, AUTH_SECRET, "early-exit-worker");
+      const stateFile = resolveSessionPidFile("early-exit-worker");
+      const state = readFileSync(stateFile, "utf8");
+      const start = vi.fn();
+      windowsAcl.isWindowsBridgeProcess.mockImplementation(() => {
+        throw new Error("Process ownership verification failed");
+      });
+      try {
+        await expect(
+          action === "restart" ? ensureBridge(start) : stopBridge(),
+        ).rejects.toThrow(/ownership verification failed/);
+        expect(readFileSync(stateFile, "utf8")).toBe(state);
+        expect(start).not.toHaveBeenCalled();
+      } finally {
+        windowsAcl.isWindowsBridgeProcess.mockReset();
+        windowsAcl.isWindowsBridgeProcess.mockReturnValue(false);
+        listener.closeAllConnections();
+        await new Promise<void>((closed) => listener.close(() => closed()));
+      }
+    },
+  );
 
   it("reuses a healthy same-session bridge that won the bind race instead of failing on the loser's early exit", async () => {
     // A concurrent same-session bridge owns the port and reports healthy only on

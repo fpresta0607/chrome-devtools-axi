@@ -1,12 +1,21 @@
 import { execFileSync, spawn } from "node:child_process";
 import { once } from "node:events";
-import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { describe, expect, it } from "vitest";
 import {
   isWindowsBridgeProcess,
   secureWindowsPath,
+  secureWindowsPaths,
   verifyWindowsState,
 } from "../src/windows-acl.js";
 
@@ -18,6 +27,54 @@ function grant(path: string, sid: string): void {
 }
 
 describe.runIf(process.platform === "win32")("Windows ACL enforcement", () => {
+  it("migrates owned inherited state and removes explicit grants before reading", () => {
+    const home = mkdtempSync(join(tmpdir(), "axi-windows-acl-"));
+    const directory = join(home, "legacy-state");
+    const file = join(directory, "bridge.pid");
+    try {
+      mkdirSync(directory);
+      writeFileSync(file, JSON.stringify({ pid: process.pid, port: 9224 }));
+      grant(directory, "S-1-1-0");
+      grant(file, "S-1-1-0");
+      expect(() => verifyWindowsState([directory], file)).toThrow(/ACL/);
+
+      secureWindowsPaths([directory], "prepare-directory", file);
+
+      expect(() => verifyWindowsState([directory], file)).not.toThrow();
+      expect(JSON.parse(readFileSync(file, "utf8"))).toEqual({
+        pid: process.pid,
+        port: 9224,
+      });
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
+  }, 20_000);
+
+  it("rejects a legacy directory junction before changing its target ACL", () => {
+    const home = mkdtempSync(join(tmpdir(), "axi-windows-acl-"));
+    const target = join(home, "target");
+    const directory = join(home, "legacy-state");
+    try {
+      mkdirSync(target);
+      grant(target, "S-1-1-0");
+      writeFileSync(join(target, "bridge.pid"), "{}");
+      symlinkSync(target, directory, "junction");
+
+      expect(() =>
+        secureWindowsPaths(
+          [directory],
+          "prepare-directory",
+          join(directory, "bridge.pid"),
+        ),
+      ).toThrow(/ACL/);
+      expect(() => secureWindowsPath(target, "verify-directory")).toThrow(
+        /ACL/,
+      );
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
+  }, 20_000);
+
   it("creates and revalidates owner-protected directories and inherited token ACLs", () => {
     const home = mkdtempSync(join(tmpdir(), "axi-windows-acl-"));
     const directory = join(home, "protected-state");

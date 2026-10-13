@@ -1203,6 +1203,7 @@ async function closeServer(server: Server): Promise<void> {
         resolve();
       }
     });
+    server.closeAllConnections();
   });
 }
 
@@ -1233,7 +1234,7 @@ export async function runBridge(port = resolveSessionPort()): Promise<void> {
     idleTimeoutMs > 0
       ? createIdleTracker(idleTimeoutMs, () => {
           logBridgeMessage(
-            `No activity for ${idleTimeoutMs}ms (${IDLE_TIMEOUT_ENV}); shutting down`,
+            `No activity for ${idleTimeoutMs}ms (${IDLE_TIMEOUT_ENV}). Shutting down`,
           );
           void shutdown();
         })
