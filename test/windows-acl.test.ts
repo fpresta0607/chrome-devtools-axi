@@ -11,7 +11,7 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import {
   isWindowsBridgeProcess,
   secureWindowsPath,
@@ -27,6 +27,44 @@ function grant(path: string, sid: string): void {
 }
 
 describe.runIf(process.platform === "win32")("Windows ACL enforcement", () => {
+  it.each(["PSModulePath", "PSMODULEPATH"])(
+    "verifies ACLs and processes despite an incompatible inherited %s",
+    (variable) => {
+      const home = mkdtempSync(join(tmpdir(), "axi-windows-acl-"));
+      const modules = join(home, "modules");
+      const module = join(modules, "Microsoft.PowerShell.Utility");
+      const directory = join(home, "protected-state");
+      const file = join(directory, "bridge.pid");
+      try {
+        mkdirSync(module, { recursive: true });
+        writeFileSync(
+          join(module, "Microsoft.PowerShell.Utility.psd1"),
+          "@{ ModuleVersion = '7.0.0'; PowerShellVersion = '7.0'; CmdletsToExport = @('ConvertFrom-Json') }",
+        );
+        vi.stubEnv(variable, modules);
+
+        secureWindowsPaths([directory], "prepare-directory");
+        writeFileSync(file, "legacy state");
+        grant(file, "S-1-1-0");
+        expect(() => verifyWindowsState([directory], file)).toThrow(/ACL/);
+        secureWindowsPaths([directory], "prepare-directory", file);
+
+        expect(() =>
+          secureWindowsPath(directory, "verify-directory"),
+        ).not.toThrow();
+        expect(() => secureWindowsPath(file, "verify-file")).not.toThrow();
+        expect(() => verifyWindowsState([directory], file)).not.toThrow();
+        expect(readFileSync(file, "utf8")).toBe("legacy state");
+        expect(isWindowsBridgeProcess(process.pid, 9224)).toBe(false);
+        expect(process.env[variable]).toBe(modules);
+      } finally {
+        vi.unstubAllEnvs();
+        rmSync(home, { recursive: true, force: true });
+      }
+    },
+    30_000,
+  );
+
   it("migrates owned inherited state and removes explicit grants before reading", () => {
     const home = mkdtempSync(join(tmpdir(), "axi-windows-acl-"));
     const directory = join(home, "legacy-state");

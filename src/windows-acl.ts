@@ -105,6 +105,12 @@ function runWindowsVerification(input: object): string {
         Buffer.from(ACL_SCRIPT, "utf16le").toString("base64"),
       ],
       {
+        // Let Windows PowerShell rebuild its own module path after a pwsh parent.
+        env: Object.fromEntries(
+          Object.entries(process.env).filter(
+            ([name]) => name.toUpperCase() !== "PSMODULEPATH",
+          ),
+        ),
         input: request,
         encoding: "utf8",
         // WMI process and socket queries can take several seconds on a loaded
