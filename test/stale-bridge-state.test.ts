@@ -116,12 +116,37 @@ describe("a bridge record whose pid now belongs to an unrelated process", () => 
     }
   }, 30_000);
 
-  it.each(["absent", "unsigned", "wrongly signed"])(
+  it.each([
+    "absent",
+    "unsigned",
+    "wrongly signed",
+    "upgrade",
+    "truncated",
+    "closed",
+  ])(
     "is replaced without terminating that process when the old listener is %s",
     async (listener) => {
       const port = await freePort();
       process.env.CHROME_DEVTOOLS_AXI_PORT = String(port);
       const squatter = createServer((request, response) => {
+        if (listener === "upgrade") {
+          response.writeHead(101, {
+            Connection: "Upgrade",
+            Upgrade: "websocket",
+          });
+          response.end();
+          return;
+        }
+        if (listener === "truncated") {
+          response.writeHead(200, { "Content-Length": "1024" });
+          response.write("{");
+          response.socket?.end();
+          return;
+        }
+        if (listener === "closed") {
+          response.destroy();
+          return;
+        }
         const body = JSON.stringify({ status: "ok", session: SESSION });
         if (listener === "wrongly signed") {
           response.setHeader(

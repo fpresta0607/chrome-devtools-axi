@@ -7,7 +7,7 @@ import {
   type IncomingMessage,
   type ServerResponse,
 } from "node:http";
-import { AddressInfo } from "node:net";
+import { AddressInfo, type Socket } from "node:net";
 import {
   chmodSync,
   mkdtempSync,
@@ -359,6 +359,35 @@ describe("checkBridgeHealth (deep probe)", () => {
     }
   });
 
+  it("accepts a complete signed response delimited by connection closure", async () => {
+    const server = createServer((request, response) => {
+      const body = JSON.stringify({ status: "ok" });
+      response.setHeader(
+        RESPONSE_PROOF_HEADER,
+        RESPONSE_AUTH.signResponse(
+          request.headers.authorization ?? "",
+          200,
+          body,
+        ),
+      );
+      response.setHeader("Connection", "close");
+      response.useChunkedEncodingByDefault = false;
+      response.write(body);
+      response.end();
+    });
+    await new Promise<void>((ready) => server.listen(0, "127.0.0.1", ready));
+    try {
+      const { port } = server.address() as AddressInfo;
+
+      await expect(
+        checkBridgeHealth(port, { secret: AUTH_SECRET }),
+      ).resolves.toBe(true);
+    } finally {
+      server.closeAllConnections();
+      await new Promise<void>((closed) => server.close(() => closed()));
+    }
+  });
+
   it("returns false on the deep probe when the bridge reports CDP target unreachable", async () => {
     // This is the exact stale-bridge scenario from issue #43: the local MCP
     // server still answers /health, but the attached browser is gone, so the
@@ -589,7 +618,8 @@ describe("ensureBridge early-exit fast-fail", () => {
     rmSync(tmpHome, { recursive: true, force: true });
   });
 
-  it("fails fast with a port-collision error when the bridge exits with the EADDRINUSE code", async () => {
+  it("reports a port collision after the readiness deadline when no winner publishes state", async () => {
+    process.env.CHROME_DEVTOOLS_AXI_BRIDGE_TIMEOUT_MS = "1000";
     const start = Date.now();
     let caught: unknown;
     try {
@@ -612,9 +642,172 @@ describe("ensureBridge early-exit fast-fail", () => {
     expect((caught as CdpError).suggestions.join("\n")).toContain(
       "CHROME_DEVTOOLS_AXI_PORT",
     );
-    // The whole point: detecting the early exit must beat the 20s deadline.
+    expect(elapsed).toBeGreaterThanOrEqual(1000);
     expect(elapsed).toBeLessThan(5000);
   });
+
+  it.each([
+    ["shallow health", "upgrade"],
+    ["deep health", "upgrade"],
+    ["tool call", "upgrade"],
+    ["ambient health", "upgrade"],
+    ["ambient snapshot", "upgrade"],
+    ["shallow health", "truncated"],
+    ["deep health", "truncated"],
+    ["tool call", "truncated"],
+    ["ambient health", "truncated"],
+    ["ambient snapshot", "truncated"],
+  ])(
+    "settles %s on an untrusted %s response",
+    async (consumer, responseType) => {
+      const sockets = new Set<Socket>();
+      let upgradedSocket: Socket | undefined;
+      const requests: string[] = [];
+      const should_fail_call =
+        consumer === "tool call" || consumer === "ambient snapshot";
+      const server = createServer((request, response) => {
+        requests.push(`${request.method} ${request.url}`);
+        if (should_fail_call && request.url?.startsWith("/health")) {
+          signFakeResponse(request, response);
+          response.end(
+            JSON.stringify({ status: "ok", session: "early-exit-worker" }),
+          );
+        } else if (responseType === "upgrade") {
+          upgradedSocket = request.socket;
+          response.writeHead(101, {
+            Connection: "Upgrade",
+            Upgrade: "websocket",
+          });
+          response.end();
+        } else {
+          response.writeHead(200, { "Content-Length": "1024" });
+          response.write("{");
+          response.socket?.end();
+        }
+      });
+      server.on("connection", (socket) => {
+        sockets.add(socket);
+        socket.once("close", () => sockets.delete(socket));
+      });
+      await new Promise<void>((ready) => server.listen(0, "127.0.0.1", ready));
+      const { port } = server.address() as AddressInfo;
+      writeBridgeState(port, AUTH_SECRET, "early-exit-worker");
+      setSelectedPageId(1);
+      let deadline: ReturnType<typeof setTimeout> | undefined;
+      try {
+        const operation = consumer.startsWith("ambient")
+          ? getSessionSnapshotIfRunning()
+          : consumer === "tool call"
+            ? callTool("list_pages")
+            : checkBridgeHealth(port, {
+                secret: AUTH_SECRET,
+                deep: consumer === "deep health",
+              });
+        const bounded = Promise.race([
+          operation,
+          new Promise<never>((_resolve, reject) => {
+            deadline = setTimeout(
+              () => reject(new Error("Bridge request did not settle")),
+              2500,
+            );
+          }),
+        ]);
+
+        if (consumer.startsWith("ambient")) {
+          await expect(bounded).resolves.toBeNull();
+        } else {
+          await expect(bounded).rejects.toThrow("Bridge authentication failed");
+        }
+        expect(requests).toEqual(
+          should_fail_call
+            ? [
+                consumer === "tool call" ? "GET /health?deep=1" : "GET /health",
+                "POST /call",
+              ]
+            : [
+                consumer === "deep health"
+                  ? "GET /health?deep=1"
+                  : "GET /health",
+              ],
+        );
+        if (responseType === "upgrade") {
+          await expect.poll(() => upgradedSocket?.destroyed).toBe(true);
+        }
+      } finally {
+        clearTimeout(deadline);
+        for (const socket of sockets) socket.destroy();
+        server.closeAllConnections();
+        await new Promise<void>((closed) => server.close(() => closed()));
+      }
+    },
+  );
+
+  it.each(["ready", "wrong session", "wrong key", "unhealthy target"])(
+    "waits for state published after a bind collision and checks a %s winner",
+    async (outcome) => {
+      process.env.CHROME_DEVTOOLS_AXI_BRIDGE_TIMEOUT_MS = "2000";
+      let healthRequests = 0;
+      const winner = createServer((request, response) => {
+        healthRequests++;
+        const is_healthy =
+          outcome !== "unhealthy target" || request.url === "/health";
+        const body = JSON.stringify({
+          status: is_healthy ? "ok" : "error",
+          session:
+            outcome === "wrong session"
+              ? "another-worker"
+              : "early-exit-worker",
+        });
+        response.statusCode = is_healthy ? 200 : 503;
+        response.setHeader(
+          RESPONSE_PROOF_HEADER,
+          createBridgeAuth(
+            outcome === "wrong key" ? "b".repeat(64) : AUTH_SECRET,
+          ).signResponse(
+            request.headers.authorization ?? "",
+            response.statusCode,
+            body,
+          ),
+        );
+        response.end(body);
+      });
+      await new Promise<void>((ready) => winner.listen(0, "127.0.0.1", ready));
+      const { port } = winner.address() as AddressInfo;
+      process.env.CHROME_DEVTOOLS_AXI_PORT = String(port);
+      let publication: ReturnType<typeof setTimeout> | undefined;
+      let has_loser_exited = false;
+      try {
+        const operation = ensureBridge(() => {
+          const loser = new EventEmitter();
+          setImmediate(() => {
+            has_loser_exited = true;
+            loser.emit("exit", BRIDGE_PORT_IN_USE_EXIT_CODE, null);
+            publication = setTimeout(() => {
+              writeBridgeState(port, AUTH_SECRET, "early-exit-worker");
+            }, 650);
+          });
+          return loser;
+        });
+
+        if (outcome === "ready") {
+          await expect(operation).resolves.toBe(port);
+        } else {
+          await expect(operation).rejects.toMatchObject({
+            code: "BRIDGE_NOT_READY",
+            suggestions: expect.arrayContaining([
+              expect.stringContaining("CHROME_DEVTOOLS_AXI_PORT"),
+            ]),
+          });
+        }
+        expect(has_loser_exited).toBe(true);
+        expect(healthRequests).toBeGreaterThan(0);
+      } finally {
+        clearTimeout(publication);
+        winner.closeAllConnections();
+        await new Promise<void>((closed) => winner.close(() => closed()));
+      }
+    },
+  );
 
   it("fails fast with generic startup guidance for a non-EADDRINUSE early exit", async () => {
     const start = Date.now();

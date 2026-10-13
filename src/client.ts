@@ -5,7 +5,7 @@
 import { isUtf8 } from "node:buffer";
 import { execFileSync, spawn } from "node:child_process";
 import { existsSync } from "node:fs";
-import { request } from "node:http";
+import { request, type IncomingMessage } from "node:http";
 import { dirname, join } from "node:path";
 import { AxiError } from "axi-sdk-js";
 import {
@@ -103,6 +103,7 @@ function authenticatedRequest(
 ): Promise<string> {
   const headers = createAuthHeaders(secret, method, path, payload, is_ambient);
   return new Promise((resolve, reject) => {
+    let response: IncomingMessage | undefined;
     const req = request(
       {
         hostname: "127.0.0.1",
@@ -120,6 +121,7 @@ function authenticatedRequest(
         },
       },
       (res) => {
+        response = res;
         const chunks: Buffer[] = [];
         let size = 0;
         res.on("data", (chunk: Buffer) => {
@@ -130,7 +132,7 @@ function authenticatedRequest(
           }
           chunks.push(chunk);
         });
-        res.on("error", reject);
+        res.on("error", () => reject(new BridgeAuthenticationError()));
         res.on("end", () => {
           const body = Buffer.concat(chunks);
           if (!isUtf8(body)) {
@@ -163,7 +165,14 @@ function authenticatedRequest(
       timeoutMs,
     );
     deadline.unref();
-    req.on("close", () => clearTimeout(deadline));
+    req.on("upgrade", (_response, socket) => {
+      socket.destroy();
+      reject(new BridgeAuthenticationError());
+    });
+    req.on("close", () => {
+      clearTimeout(deadline);
+      if (!response?.complete) reject(new BridgeAuthenticationError());
+    });
     req.on("error", reject);
     req.end(payload);
   });
@@ -552,11 +561,6 @@ export async function ensureBridge(
   // Start a new bridge
   const child = spawnBridge(port, sessionName);
 
-  // If the freshly spawned bridge dies before it reports healthy - an EADDRINUSE
-  // port collision with another session, or a startup failure (npx/MCP launch,
-  // Chrome), whose stderr is lost to `stdio: "ignore"` - fail fast
-  // instead of polling the full readiness deadline and reporting a generic
-  // timeout. The exit code attributes the cause (see buildBridgeEarlyExitError).
   let childExited = false;
   let exitCode: number | null = null;
   let exitSignal: NodeJS.Signals | null = null;
@@ -593,7 +597,7 @@ export async function ensureBridge(
     if (await isReady(true)) {
       return port;
     }
-    if (childExited) {
+    if (childExited && exitCode !== BRIDGE_PORT_IN_USE_EXIT_CODE) {
       if (await isReady(true)) {
         return port;
       }
@@ -603,6 +607,10 @@ export async function ensureBridge(
       sawShallowReady = true;
     }
     await sleep(500);
+  }
+
+  if (childExited) {
+    throw buildBridgeEarlyExitError(sessionName, port, exitCode, exitSignal);
   }
 
   const seconds = Math.round(timeoutMs / 1000);
