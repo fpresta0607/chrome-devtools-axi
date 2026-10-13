@@ -30,7 +30,7 @@ jobs:
           cache: pnpm
 
       - run: pnpm install --frozen-lockfile
-      - run: pnpm exec tsc
+      - run: pnpm run build
       - name: Prove the Windows user boundary without Chrome
         shell: pwsh
         run: ./scripts/windows-user-security.ps1

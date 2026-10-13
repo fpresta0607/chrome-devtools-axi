@@ -31,7 +31,7 @@
     "access": "public"
   },
   "scripts": {
-    "build": "tsc && chmod +x dist/bin/chrome-devtools-axi.js",
+    "build": "tsc && node --input-type=module -e \"import { chmodSync } from 'node:fs'; chmodSync('dist/bin/chrome-devtools-axi.js', 0o755)\"",
     "build:skill": "tsx scripts/build-skill.ts",
     "dev": "tsx bin/chrome-devtools-axi.ts",
     "test": "vitest run",
@@ -43,8 +43,8 @@
     "node": ">=20"
   },
   "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.12.1",
-    "@toon-format/toon": "^2.1.0",
+    "@modelcontextprotocol/sdk": "^1.32.1",
+    "@toon-format/toon": "^2.3.1",
     "axi-sdk-js": "^0.1.10"
   },
   "devDependencies": {
