@@ -2,6 +2,7 @@ import { spawnSync } from "node:child_process";
 import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
+import { pathToFileURL } from "node:url";
 import { beforeAll, describe, expect, it } from "vitest";
 
 import pkg from "../package.json" with { type: "json" };
@@ -16,11 +17,9 @@ import pkg from "../package.json" with { type: "json" };
 const ROOT = resolve(import.meta.dirname, "..");
 const CLI_BIN = join(ROOT, "dist", "bin", "chrome-devtools-axi.js");
 const BRIDGE_BIN = join(ROOT, "dist", "bin", "chrome-devtools-axi-bridge.js");
-const TRACE_REGISTER = join(
-  import.meta.dirname,
-  "fixtures",
-  "module-trace-register.mjs",
-);
+const TRACE_REGISTER = pathToFileURL(
+  join(import.meta.dirname, "fixtures", "module-trace-register.mjs"),
+).href;
 
 beforeAll(() => {
   // The test spawns the built CLI, so `pnpm test` on a fresh checkout has to

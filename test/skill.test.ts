@@ -28,10 +28,11 @@ function skillBody(markdown: string): string {
 
 describe("createSkillMarkdown", () => {
   it("matches the committed skills/chrome-devtools-axi/SKILL.md", () => {
+    // core.autocrlf checks the file out with CRLF on Windows.
     const committed = readFileSync(
       new URL("../skills/chrome-devtools-axi/SKILL.md", import.meta.url),
       "utf8",
-    );
+    ).replace(/\r\n/g, "\n");
     expect(committed).toBe(createSkillMarkdown());
   });
 

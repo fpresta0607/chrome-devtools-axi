@@ -38,6 +38,20 @@ import { CdpError, getSessionSnapshotIfRunning } from "../src/client.js";
 import * as generation from "../src/generation.js";
 import { setSelectedPageId } from "../src/selected-page.js";
 
+// Creating a symlink needs Developer Mode or elevation on Windows.
+function canCreateSymlinks(): boolean {
+  const directory = mkdtempSync(join(tmpdir(), "chrome-devtools-axi-link-"));
+  try {
+    mkdirSync(join(directory, "target"));
+    symlinkSync(join(directory, "target"), join(directory, "linked"));
+    return true;
+  } catch {
+    return false;
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+}
+
 /**
  * The reconnect-cleared error exactly as `src/client.ts` ships it, rebuilt on
  * the mocked `CdpError` so `isRecoverableOpenError`'s `instanceof` still holds.
@@ -417,15 +431,17 @@ describe("main", () => {
     const write = vi
       .spyOn(process.stdout, "write")
       .mockImplementation(() => true);
-    callTool.mockResolvedValueOnce("Saved screenshot to /caller/dir/shot.png.");
+    const expected = resolve("/caller/dir", "./shot.png");
+    callTool.mockResolvedValueOnce(`Saved screenshot to ${expected}.`);
 
     await main(["screenshot", "./shot.png"]);
 
-    const expected = resolve("/caller/dir", "./shot.png");
     expect(callTool).toHaveBeenCalledWith("take_screenshot", {
       filePath: expected,
     });
-    expect(String(write.mock.calls[0]?.[0])).toContain(expected);
+    expect(decode(String(write.mock.calls[0]?.[0]))).toMatchObject({
+      screenshot: expected,
+    });
   });
 
   it.each([
@@ -489,7 +505,7 @@ describe("main", () => {
     },
   );
 
-  it.each(
+  it.skipIf(!canCreateSymlinks()).for(
     [
       { format: undefined, input: "shot.png", output: "shot.webp" },
       { format: "jpeg", input: "shot.webp", output: "shot.jpeg" },
@@ -526,11 +542,27 @@ describe("main", () => {
     ]),
   )(
     "reports the canonical MCP saved path for $input with format $format and suffix $suffix",
-    async ({ format, input, output, suffix }) => {
+    async ({ format, input, output, suffix }, context) => {
       const directory = mkdtempSync(
         join(tmpdir(), "chrome-devtools-axi-shot-"),
       );
       try {
+        if (input.includes("\n") || output.includes("\n")) {
+          try {
+            writeFileSync(join(directory, "probe\nfilename"), "");
+          } catch (error) {
+            if (
+              !(error instanceof Error) ||
+              !("code" in error) ||
+              (error.code !== "EINVAL" && error.code !== "ENOENT")
+            ) {
+              throw error;
+            }
+            context.skip(
+              "Filesystem cannot create filenames containing newlines",
+            );
+          }
+        }
         const targetDirectory = join(directory, "target");
         const linkedDirectory = join(directory, "linked");
         mkdirSync(targetDirectory);
@@ -596,7 +628,9 @@ describe("main", () => {
     expect(callTool).toHaveBeenCalledWith("take_memory_snapshot", {
       filePath: expected,
     });
-    expect(String(write.mock.calls[0]?.[0])).toContain(expected);
+    expect(decode(String(write.mock.calls[0]?.[0]))).toMatchObject({
+      heap: expected,
+    });
   });
 
   it("resolves relative network-get output paths against caller cwd", async () => {
@@ -646,7 +680,9 @@ describe("main", () => {
     expect(callTool).toHaveBeenCalledWith("performance_start_trace", {
       filePath: expected,
     });
-    expect(String(write.mock.calls[0]?.[0])).toContain(expected);
+    expect(decode(String(write.mock.calls[0]?.[0]))).toMatchObject({
+      filePath: expected,
+    });
   });
 
   it("resolves relative perf-stop --file path against caller cwd", async () => {

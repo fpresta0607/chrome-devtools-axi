@@ -40,7 +40,7 @@ See the [no-mistakes quick start](https://kunchenguid.github.io/no-mistakes/star
 - See [AGENTS.md](AGENTS.md#commands) for test and formatting commands.
 - Use pnpm for package scripts.
 - Run `pnpm run build` and `pnpm test` before pushing.
-- The pipeline will run them again, but a fast local pass saves rounds.
+- [`.no-mistakes.yaml`](.no-mistakes.yaml) owns the gate's preparation and test commands, including its worker limits.
 - Do not hand-edit `skills/chrome-devtools-axi/SKILL.md`.
 - It is a minimal discovery stub generated from `src/skill.ts` by `pnpm run build:skill`, and `pnpm test` fails if it drifts.
 - Update `src/skill.ts` for body or frontmatter changes; the stub points to the CLI instead of duplicating its guidance.
