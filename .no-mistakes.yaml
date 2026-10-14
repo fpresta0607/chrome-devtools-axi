@@ -1,0 +1,3 @@
+commands:
+  prepare: "pnpm install --frozen-lockfile"
+  test: "pnpm run build && pnpm test --maxWorkers=1 --minWorkers=1"

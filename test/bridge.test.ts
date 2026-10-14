@@ -176,7 +176,7 @@ describe("getErrorMessage", () => {
 describe("resolveBridgeScript", () => {
   it("prefers the TypeScript bridge entrypoint in the repo checkout", () => {
     expect(resolveBridgeScript(import.meta.dirname)).toMatch(
-      /bin\/chrome-devtools-axi-bridge\.ts$/,
+      /bin[\\/]chrome-devtools-axi-bridge\.ts$/,
     );
   });
 });
@@ -715,18 +715,24 @@ describe("resolveTransportSpec", () => {
   });
 
   it("auto-detects a globally-installed chrome-devtools-mcp when MCP_PATH and PATH are unavailable", () => {
+    const globalMcpPath = join(
+      "/usr",
+      "lib",
+      "node_modules",
+      "chrome-devtools-mcp",
+      "build",
+      "src",
+      "bin",
+      "chrome-devtools-mcp.js",
+    );
     const probe = {
-      existsSync: (path: string) =>
-        path ===
-        "/usr/lib/node_modules/chrome-devtools-mcp/build/src/bin/chrome-devtools-mcp.js",
+      existsSync: (path: string) => path === globalMcpPath,
       getNpmPrefix: vi.fn(() => "/usr"),
       findOnPath: vi.fn(() => null),
     };
     const spec = resolveTransportSpec(probe);
     expect(spec.command).toBe(process.execPath);
-    expect(spec.args[0]).toBe(
-      "/usr/lib/node_modules/chrome-devtools-mcp/build/src/bin/chrome-devtools-mcp.js",
-    );
+    expect(spec.args[0]).toBe(globalMcpPath);
     expect(spec.args).not.toContain("-y");
     expect(spec.args).not.toContain("chrome-devtools-mcp@latest");
     expect(spec.args).toContain("--isolated");

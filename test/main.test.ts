@@ -44,6 +44,20 @@ import { setSelectedPageId } from "../src/selected-page.js";
  * Taking the message from production rather than copying it is the point: it
  * is what `open`'s documented post-reconnect recovery is pinned on.
  */
+// Creating a symlink needs Developer Mode or elevation on Windows.
+function canCreateSymlinks(): boolean {
+  const directory = mkdtempSync(join(tmpdir(), "chrome-devtools-axi-link-"));
+  try {
+    mkdirSync(join(directory, "target"));
+    symlinkSync(join(directory, "target"), join(directory, "linked"));
+    return true;
+  } catch {
+    return false;
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+}
+
 async function reconnectClearedError(): Promise<CdpError> {
   const actual =
     await vi.importActual<typeof import("../src/client.js")>(
@@ -417,15 +431,17 @@ describe("main", () => {
     const write = vi
       .spyOn(process.stdout, "write")
       .mockImplementation(() => true);
-    callTool.mockResolvedValueOnce("Saved screenshot to /caller/dir/shot.png.");
+    const expected = resolve("/caller/dir", "./shot.png");
+    callTool.mockResolvedValueOnce(`Saved screenshot to ${expected}.`);
 
     await main(["screenshot", "./shot.png"]);
 
-    const expected = resolve("/caller/dir", "./shot.png");
     expect(callTool).toHaveBeenCalledWith("take_screenshot", {
       filePath: expected,
     });
-    expect(String(write.mock.calls[0]?.[0])).toContain(expected);
+    expect(decode(String(write.mock.calls[0]?.[0]))).toMatchObject({
+      screenshot: expected,
+    });
   });
 
   it.each([
@@ -489,7 +505,7 @@ describe("main", () => {
     },
   );
 
-  it.each(
+  it.skipIf(!canCreateSymlinks()).each(
     [
       { format: undefined, input: "shot.png", output: "shot.webp" },
       { format: "jpeg", input: "shot.webp", output: "shot.jpeg" },
@@ -596,7 +612,9 @@ describe("main", () => {
     expect(callTool).toHaveBeenCalledWith("take_memory_snapshot", {
       filePath: expected,
     });
-    expect(String(write.mock.calls[0]?.[0])).toContain(expected);
+    expect(decode(String(write.mock.calls[0]?.[0]))).toMatchObject({
+      heap: expected,
+    });
   });
 
   it("resolves relative network-get output paths against caller cwd", async () => {
@@ -646,7 +664,9 @@ describe("main", () => {
     expect(callTool).toHaveBeenCalledWith("performance_start_trace", {
       filePath: expected,
     });
-    expect(String(write.mock.calls[0]?.[0])).toContain(expected);
+    expect(decode(String(write.mock.calls[0]?.[0]))).toMatchObject({
+      filePath: expected,
+    });
   });
 
   it("resolves relative perf-stop --file path against caller cwd", async () => {

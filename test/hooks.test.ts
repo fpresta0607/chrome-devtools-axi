@@ -1,3 +1,4 @@
+import { join } from "node:path";
 import { describe, it, expect, vi } from "vitest";
 
 const { installSessionStartHooks } = vi.hoisted(() => ({
@@ -204,12 +205,12 @@ describe("getHookTargets", () => {
     const targets = getHookTargets();
     expect(targets.length).toBe(3);
     expect(targets.some((t) => t.path.includes(".claude"))).toBe(true);
-    expect(targets.some((t) => t.path.includes(".codex/hooks.json"))).toBe(
-      true,
-    );
-    expect(targets.some((t) => t.path.includes(".codex/config.toml"))).toBe(
-      true,
-    );
+    expect(
+      targets.some((t) => t.path.includes(join(".codex", "hooks.json"))),
+    ).toBe(true);
+    expect(
+      targets.some((t) => t.path.includes(join(".codex", "config.toml"))),
+    ).toBe(true);
   });
 
   it("Claude target reads from settings.json", () => {
@@ -224,7 +225,7 @@ describe("getHookTargets", () => {
 
   it("Codex config target reads from config.toml", () => {
     const codex = getHookTargets().find((t) =>
-      t.path.includes(".codex/config.toml"),
+      t.path.includes(join(".codex", "config.toml")),
     );
     expect(codex!.path).toMatch(/config\.toml$/);
   });

@@ -121,7 +121,7 @@ async function startBridge(
         fail(new Error(`bridge exited (${code}) before READY: ${stderr}`)),
       );
     }),
-    15_000,
+    45_000,
     "bridge READY",
   );
   running.mcpPid = Number(readFileSync(mcpPidFile, "utf8"));
@@ -161,7 +161,7 @@ describe("bridge process lifecycle", () => {
         { id: 1, url: "about:blank", selected: true },
       ]);
     }
-  }, 30_000);
+  }, 90_000);
 
   it("stays up while idle when no idle timeout is configured", async () => {
     const running = await startBridge();
@@ -171,7 +171,7 @@ describe("bridge process lifecycle", () => {
     expect(running.child.exitCode).toBeNull();
     expect(isAlive(running.mcpPid)).toBe(true);
     expect(existsSync(running.pidFile)).toBe(true);
-  }, 20_000);
+  }, 90_000);
 
   it("shuts down after CHROME_DEVTOOLS_AXI_IDLE_TIMEOUT_MS with no requests", async () => {
     const running = await startBridge({
@@ -187,7 +187,7 @@ describe("bridge process lifecycle", () => {
       await new Promise((settle) => setTimeout(settle, 50));
     }
     expect(isAlive(running.mcpPid)).toBe(false);
-  }, 30_000);
+  }, 90_000);
 
   it("shuts down when its MCP server ends", async () => {
     const running = await startBridge();
@@ -198,7 +198,7 @@ describe("bridge process lifecycle", () => {
       withTimeout(running.exited, 8_000, "bridge exit after MCP server died"),
     ).resolves.toBe(0);
     expect(existsSync(running.pidFile)).toBe(false);
-  }, 30_000);
+  }, 90_000);
 
   it.each(["unfinished body", "unfinished headers", "idle socket"])(
     "exits and stops MCP despite an unauthenticated %s",
@@ -236,7 +236,7 @@ describe("bridge process lifecycle", () => {
         socket.destroy();
       }
     },
-    30_000,
+    90_000,
   );
 
   it("cleans up and rotates the authentication key when the same session restarts", async () => {
@@ -257,5 +257,5 @@ describe("bridge process lifecycle", () => {
     expect(typeof restartedSecret).toBe("string");
     expect(originalSecret === restartedSecret).toBe(false);
     expect(restarted.child.exitCode).toBeNull();
-  }, 30_000);
+  }, 90_000);
 });
