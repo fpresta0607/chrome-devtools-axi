@@ -38,12 +38,6 @@ import { CdpError, getSessionSnapshotIfRunning } from "../src/client.js";
 import * as generation from "../src/generation.js";
 import { setSelectedPageId } from "../src/selected-page.js";
 
-/**
- * The reconnect-cleared error exactly as `src/client.ts` ships it, rebuilt on
- * the mocked `CdpError` so `isRecoverableOpenError`'s `instanceof` still holds.
- * Taking the message from production rather than copying it is the point: it
- * is what `open`'s documented post-reconnect recovery is pinned on.
- */
 // Creating a symlink needs Developer Mode or elevation on Windows.
 function canCreateSymlinks(): boolean {
   const directory = mkdtempSync(join(tmpdir(), "chrome-devtools-axi-link-"));
@@ -58,6 +52,12 @@ function canCreateSymlinks(): boolean {
   }
 }
 
+/**
+ * The reconnect-cleared error exactly as `src/client.ts` ships it, rebuilt on
+ * the mocked `CdpError` so `isRecoverableOpenError`'s `instanceof` still holds.
+ * Taking the message from production rather than copying it is the point: it
+ * is what `open`'s documented post-reconnect recovery is pinned on.
+ */
 async function reconnectClearedError(): Promise<CdpError> {
   const actual =
     await vi.importActual<typeof import("../src/client.js")>(
@@ -505,7 +505,7 @@ describe("main", () => {
     },
   );
 
-  it.skipIf(!canCreateSymlinks()).each(
+  it.skipIf(!canCreateSymlinks()).for(
     [
       { format: undefined, input: "shot.png", output: "shot.webp" },
       { format: "jpeg", input: "shot.webp", output: "shot.jpeg" },
