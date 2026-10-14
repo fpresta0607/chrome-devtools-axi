@@ -542,11 +542,27 @@ describe("main", () => {
     ]),
   )(
     "reports the canonical MCP saved path for $input with format $format and suffix $suffix",
-    async ({ format, input, output, suffix }) => {
+    async ({ format, input, output, suffix }, context) => {
       const directory = mkdtempSync(
         join(tmpdir(), "chrome-devtools-axi-shot-"),
       );
       try {
+        if (input.includes("\n") || output.includes("\n")) {
+          try {
+            writeFileSync(join(directory, "probe\nfilename"), "");
+          } catch (error) {
+            if (
+              !(error instanceof Error) ||
+              !("code" in error) ||
+              (error.code !== "EINVAL" && error.code !== "ENOENT")
+            ) {
+              throw error;
+            }
+            context.skip(
+              "Filesystem cannot create filenames containing newlines",
+            );
+          }
+        }
         const targetDirectory = join(directory, "target");
         const linkedDirectory = join(directory, "linked");
         mkdirSync(targetDirectory);
