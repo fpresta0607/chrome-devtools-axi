@@ -47,7 +47,6 @@ try {
   foreach ($path in $request.paths) {
     if ($request.mode -eq 'prepare-directory') {
       $security = New-Object System.Security.AccessControl.DirectorySecurity
-      $security.SetOwner($sid)
       $security.SetAccessRuleProtection($true, $false)
       $rule = New-Object System.Security.AccessControl.FileSystemAccessRule($sid, 'FullControl', 'ContainerInherit, ObjectInherit', 'None', 'Allow')
       $security.AddAccessRule($rule)
@@ -55,6 +54,7 @@ try {
         $null = Assert-Owned $path $true $sid
         [System.IO.Directory]::SetAccessControl($path, $security)
       } else {
+        $security.SetOwner($sid)
         [void][System.IO.Directory]::CreateDirectory($path, $security)
       }
     }
@@ -64,7 +64,6 @@ try {
     if ($request.mode -eq 'prepare-directory') {
       $null = Assert-Owned $request.file $false $sid
       $security = New-Object System.Security.AccessControl.FileSecurity
-      $security.SetOwner($sid)
       $security.SetAccessRuleProtection($true, $false)
       $rule = New-Object System.Security.AccessControl.FileSystemAccessRule($sid, 'FullControl', 'Allow')
       $security.AddAccessRule($rule)

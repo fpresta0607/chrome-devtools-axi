@@ -70,8 +70,19 @@ describe.runIf(process.platform === "win32")("Windows ACL enforcement", () => {
     const directory = join(home, "legacy-state");
     const file = join(directory, "bridge.pid");
     try {
+      // Owners can replace the DACL without permission to change ownership.
+      execFileSync(
+        "icacls.exe",
+        [home, "/inheritance:r", "/grant:r", "*S-1-5-11:(OI)(CI)(M)"],
+        { windowsHide: true, stdio: "ignore" },
+      );
       mkdirSync(directory);
       writeFileSync(file, JSON.stringify({ pid: process.pid, port: 9224 }));
+      execFileSync(
+        "icacls.exe",
+        [file, "/inheritance:r", "/grant:r", "*S-1-5-11:(M)"],
+        { windowsHide: true, stdio: "ignore" },
+      );
       grant(directory, "S-1-1-0");
       grant(file, "S-1-1-0");
       expect(() => verifyWindowsState([directory], file)).toThrow(/ACL/);
