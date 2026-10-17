@@ -54,7 +54,7 @@ The skill frontmatter also includes Hermes Agent metadata (`author` plus `metada
 
 `-g` installs the skill for all projects (`~/.claude/skills/`, for example); drop it to install for the current project only (`.claude/skills/`).
 
-## What Agent Sees
+## What the Agent Sees
 
 ```sh
 $ chrome-devtools-axi open https://example.com
