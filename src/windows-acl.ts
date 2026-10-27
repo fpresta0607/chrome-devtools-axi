@@ -3,6 +3,13 @@ import { join } from "node:path";
 
 const ACL_SCRIPT = String.raw`
 $ErrorActionPreference = 'Stop'
+# Load only Windows PowerShell's own modules, by path. Autoloading searches the
+# whole module path, including the user's modules, and when the caller's
+# profile is redirected that search has no analysis cache and can take a minute.
+$PSModuleAutoLoadingPreference = 'None'
+foreach ($module in 'Microsoft.PowerShell.Utility', 'Microsoft.PowerShell.Management', 'Microsoft.PowerShell.Security', 'CimCmdlets') {
+  Import-Module -Name "$PSHOME\Modules\$module"
+}
 function Assert-Owned([string]$path, [bool]$isDirectory, $sid) {
   $item = Get-Item -Force -LiteralPath $path
   if (($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0 -or $item.PSIsContainer -ne $isDirectory) { throw 'Denied' }
