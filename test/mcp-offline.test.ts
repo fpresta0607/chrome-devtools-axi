@@ -80,8 +80,7 @@ describe("chrome-devtools-mcp started by the bridge", () => {
     // Act
     await client.connect(bridgeTransport.transport);
     const deadline = Date.now() + CHECKER_WINDOW_MS;
-    while (Date.now() < deadline && requests.length === 0)
-      await sleep(100);
+    while (Date.now() < deadline && requests.length === 0) await sleep(100);
 
     // Assert
     expect(requests).toEqual([]);
