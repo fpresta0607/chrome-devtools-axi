@@ -1,9 +1,9 @@
 import { mkdtempSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { createServer, type AddressInfo } from "node:http";
-import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { join } from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
+import { fileURLToPath } from "node:url";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { afterEach, describe, expect, it } from "vitest";
 import {
@@ -16,17 +16,11 @@ import {
  * Starts the real chrome-devtools-mcp through the bridge's own transport from
  * a fresh home, where its update cache is absent, so its startup update check
  * would run if anything let it. The home's `.npmrc` points the registry at a
- * loopback recorder, so a check that ran is seen without leaving the machine.
+ * loopback recorder, as does the telemetry fixture, so requests stay local.
  */
 
-const MCP_PATH = join(
-  dirname(
-    createRequire(import.meta.url).resolve("chrome-devtools-mcp/package.json"),
-  ),
-  "build",
-  "src",
-  "bin",
-  "chrome-devtools-mcp.js",
+const MCP_PATH = fileURLToPath(
+  new URL("./fixtures/loopback-telemetry-mcp.mjs", import.meta.url),
 );
 const HOME_VARIABLES = ["HOME", "USERPROFILE", "LOCALAPPDATA"] as const;
 const SAVED_VARIABLES = [
@@ -54,26 +48,28 @@ afterEach(async () => {
 describe("chrome-devtools-mcp started by the bridge", () => {
   it("runs no update check, writes no telemetry state and asks no registry from a fresh home", async () => {
     // Arrange
-    const registryRequests: string[] = [];
-    const registry = createServer((request, response) => {
-      registryRequests.push(`${request.method} ${request.url}`);
+    const requests: string[] = [];
+    const recorder = createServer((request, response) => {
+      requests.push(`${request.method} ${request.url}`);
       response.writeHead(404).end();
     });
     await new Promise<void>((resolveListen) =>
-      registry.listen(0, "127.0.0.1", resolveListen),
+      recorder.listen(0, "127.0.0.1", resolveListen),
     );
     cleanups.push(
       () =>
         new Promise<void>((resolveClose) =>
-          registry.close(() => resolveClose()),
+          recorder.close(() => resolveClose()),
         ),
     );
-    const { port } = registry.address() as AddressInfo;
+    const { port } = recorder.address() as AddressInfo;
     const home = mkdtempSync(join(tmpdir(), "cdp-offline-home-"));
     cleanups.push(() =>
       rmSync(home, { recursive: true, force: true, maxRetries: 5 }),
     );
-    writeFileSync(join(home, ".npmrc"), `registry=http://127.0.0.1:${port}/\n`);
+    const recorderUrl = `http://127.0.0.1:${port}`;
+    writeFileSync(join(home, ".npmrc"), `registry=${recorderUrl}/\n`);
+    writeFileSync(join(home, "recorder-url"), recorderUrl);
     for (const name of HOME_VARIABLES) process.env[name] = home;
     process.env.CHROME_DEVTOOLS_AXI_MCP_PATH = MCP_PATH;
     delete process.env.CHROME_DEVTOOLS_AXI_MCP_SERVER_URL;
@@ -84,11 +80,14 @@ describe("chrome-devtools-mcp started by the bridge", () => {
     // Act
     await client.connect(bridgeTransport.transport);
     const deadline = Date.now() + CHECKER_WINDOW_MS;
-    while (Date.now() < deadline && registryRequests.length === 0)
+    while (Date.now() < deadline && requests.length === 0)
       await sleep(100);
 
     // Assert
-    expect(registryRequests).toEqual([]);
-    expect(readdirSync(home, { recursive: true })).toEqual([".npmrc"]);
+    expect(requests).toEqual([]);
+    expect(readdirSync(home, { recursive: true }).sort()).toEqual([
+      ".npmrc",
+      "recorder-url",
+    ]);
   }, 60_000);
 });
