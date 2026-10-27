@@ -94,11 +94,13 @@ describe.runIf(process.platform === "win32")("Windows ACL enforcement", () => {
   }, 20_000);
 
   it("migrates owned state whose ACL grants its owner only Modify", () => {
+    const systemRoot = process.env.SystemRoot;
+    if (!systemRoot) throw new Error("Missing Windows system directory");
     const home = mkdtempSync(join(tmpdir(), "axi-windows-acl-"));
     const directory = join(home, "legacy-state");
     const file = join(directory, "bridge.pid");
     const user = execFileSync(
-      join(process.env.SystemRoot ?? "C:\\Windows", "System32", "whoami.exe"),
+      join(systemRoot, "System32", "whoami.exe"),
       ["/user", "/fo", "csv", "/nh"],
       { encoding: "utf8", windowsHide: true },
     )
