@@ -1034,8 +1034,24 @@ export function resolveTransport(
   return { kind: "stdio", spec: resolveTransportSpec(probe) };
 }
 
+/**
+ * Environment that turns off chrome-devtools-mcp's own network side work: its
+ * startup update check, which spawns a detached child that reads the npm
+ * registry whenever its cache under the home folder is missing or a day old,
+ * and its usage statistics. The update check has no flag, only this variable,
+ * and its notice goes to the server's stderr, which nobody reads under the
+ * detached bridge. The stdio transport passes the server only the SDK's
+ * default variables, so a caller's own `CHROME_DEVTOOLS_MCP_*` settings never
+ * reach it; these are set here for that reason.
+ */
+const MCP_SERVER_ENV = {
+  CHROME_DEVTOOLS_MCP_NO_UPDATE_CHECKS: "1",
+  CHROME_DEVTOOLS_MCP_NO_USAGE_STATISTICS: "1",
+};
+
 const DEFAULT_BRIDGE_TRANSPORT_FACTORIES: BridgeTransportFactories = {
-  createStdio: (spec) => new StdioClientTransport(spec),
+  createStdio: (spec) =>
+    new StdioClientTransport({ ...spec, env: MCP_SERVER_ENV }),
   createHttp: (url) => new StreamableHTTPClientTransport(url),
 };
 
