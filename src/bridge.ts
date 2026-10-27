@@ -928,6 +928,17 @@ export function detectGlobalMcpPath(
 }
 
 /**
+ * Disable chrome-devtools-mcp's startup update check and usage statistics for
+ * both the proxy capability probe and the stdio server. The update check has
+ * no flag, and its notice goes to stderr, which the detached bridge does not
+ * show. The stdio transport otherwise passes only the SDK's default variables.
+ */
+const MCP_SERVER_ENV = {
+  CHROME_DEVTOOLS_MCP_NO_UPDATE_CHECKS: "1",
+  CHROME_DEVTOOLS_MCP_NO_USAGE_STATISTICS: "1",
+};
+
+/**
  * Resolve the command + args used to spawn the chrome-devtools-mcp transport.
  *
  * This resolver intentionally handles only stdio paths. Shared URL + executable
@@ -958,6 +969,7 @@ export function resolveTransportSpec(
     try {
       help = execFileSync(process.execPath, [explicitPath, "--help"], {
         encoding: "utf8",
+        env: { ...process.env, ...MCP_SERVER_ENV },
         windowsHide: true,
         stdio: ["ignore", "pipe", "pipe"],
         timeout: 5_000,
@@ -1033,21 +1045,6 @@ export function resolveTransport(
   }
   return { kind: "stdio", spec: resolveTransportSpec(probe) };
 }
-
-/**
- * Environment that turns off chrome-devtools-mcp's own network side work: its
- * startup update check, which spawns a detached child that reads the npm
- * registry whenever its cache under the home folder is missing or a day old,
- * and its usage statistics. The update check has no flag, only this variable,
- * and its notice goes to the server's stderr, which nobody reads under the
- * detached bridge. The stdio transport passes the server only the SDK's
- * default variables, so a caller's own `CHROME_DEVTOOLS_MCP_*` settings never
- * reach it; these are set here for that reason.
- */
-const MCP_SERVER_ENV = {
-  CHROME_DEVTOOLS_MCP_NO_UPDATE_CHECKS: "1",
-  CHROME_DEVTOOLS_MCP_NO_USAGE_STATISTICS: "1",
-};
 
 const DEFAULT_BRIDGE_TRANSPORT_FACTORIES: BridgeTransportFactories = {
   createStdio: (spec) =>

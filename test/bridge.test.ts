@@ -6,6 +6,7 @@ import {
   existsSync,
   mkdirSync,
   mkdtempSync,
+  readFileSync,
   rmSync,
   writeFileSync,
 } from "node:fs";
@@ -1065,6 +1066,42 @@ describe("resolveTransport / createTransport", () => {
         "--server-url=http://127.0.0.1:9333/mcp",
       ]);
     } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("disables update checks and usage statistics for the proxy help probe", () => {
+    const dir = mkdtempSync(join(tmpdir(), "cdp-proxy-probe-"));
+    const mcpPath = join(dir, "mcp.cjs");
+    const environmentPath = join(dir, "environment.json");
+    process.env.CHROME_DEVTOOLS_AXI_MCP_SERVER_URL =
+      "http://127.0.0.1:9333/mcp";
+    process.env.CHROME_DEVTOOLS_AXI_MCP_PATH = mcpPath;
+    vi.stubEnv("CHROME_DEVTOOLS_MCP_NO_UPDATE_CHECKS", "0");
+    vi.stubEnv("CHROME_DEVTOOLS_MCP_NO_USAGE_STATISTICS", "0");
+    vi.stubEnv("CDP_PROXY_PROBE_INHERITED", "present");
+    writeFileSync(
+      mcpPath,
+      `if (process.argv.includes("--help")) {
+        require("node:fs").writeFileSync(${JSON.stringify(environmentPath)}, JSON.stringify([
+          process.env.CHROME_DEVTOOLS_MCP_NO_UPDATE_CHECKS,
+          process.env.CHROME_DEVTOOLS_MCP_NO_USAGE_STATISTICS,
+          process.env.CDP_PROXY_PROBE_INHERITED,
+        ]));
+        process.stdout.write("  --serverUrl  proxy\\n");
+      }`,
+    );
+
+    try {
+      resolveTransport();
+
+      expect(JSON.parse(readFileSync(environmentPath, "utf8"))).toEqual([
+        "1",
+        "1",
+        "present",
+      ]);
+    } finally {
+      vi.unstubAllEnvs();
       rmSync(dir, { recursive: true, force: true });
     }
   });
