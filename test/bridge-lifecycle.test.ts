@@ -131,7 +131,17 @@ async function startBridge(
 afterEach(() => {
   for (const running of started.splice(0)) {
     for (const pid of [running.child.pid, running.mcpPid]) {
-      if (pid && isAlive(pid)) process.kill(pid, "SIGKILL");
+      if (!pid) continue;
+      try {
+        process.kill(pid, "SIGKILL");
+      } catch (error) {
+        // Ending the bridge closes the fake MCP's stdin, so either may already
+        // be gone by the time it is killed.
+        if (
+          !(error instanceof Error && "code" in error && error.code === "ESRCH")
+        )
+          throw error;
+      }
     }
     rmSync(running.home, { recursive: true, force: true });
   }

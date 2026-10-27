@@ -11,7 +11,7 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   isWindowsBridgeProcess,
   secureWindowsPath,
@@ -27,6 +27,11 @@ function grant(path: string, sid: string): void {
 }
 
 describe.runIf(process.platform === "win32")("Windows ACL enforcement", () => {
+  // These tests block on PowerShell synchronously, and Vitest moves from one
+  // synchronous test to the next without turning the event loop. Its worker's
+  // task update replies then wait behind all of them and time out after 60s.
+  afterEach(() => new Promise((resolve) => setImmediate(resolve)));
+
   it.each(["PSModulePath", "PSMODULEPATH"])(
     "verifies ACLs and processes despite an incompatible inherited %s",
     (variable) => {
@@ -73,6 +78,44 @@ describe.runIf(process.platform === "win32")("Windows ACL enforcement", () => {
       mkdirSync(directory);
       writeFileSync(file, JSON.stringify({ pid: process.pid, port: 9224 }));
       grant(directory, "S-1-1-0");
+      grant(file, "S-1-1-0");
+      expect(() => verifyWindowsState([directory], file)).toThrow(/ACL/);
+
+      secureWindowsPaths([directory], "prepare-directory", file);
+
+      expect(() => verifyWindowsState([directory], file)).not.toThrow();
+      expect(JSON.parse(readFileSync(file, "utf8"))).toEqual({
+        pid: process.pid,
+        port: 9224,
+      });
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
+  }, 20_000);
+
+  it("migrates owned state whose ACL grants its owner only Modify", () => {
+    const home = mkdtempSync(join(tmpdir(), "axi-windows-acl-"));
+    const directory = join(home, "legacy-state");
+    const file = join(directory, "bridge.pid");
+    const user = execFileSync(
+      join(process.env.SystemRoot ?? "C:\\Windows", "System32", "whoami.exe"),
+      ["/user", "/fo", "csv", "/nh"],
+      { encoding: "utf8", windowsHide: true },
+    )
+      .trim()
+      .split(",")
+      .at(-1)
+      ?.replaceAll('"', "");
+    try {
+      mkdirSync(directory);
+      // Modify carries no WRITE_OWNER, as under a drive root where only
+      // Authenticated Users grants the owner its access.
+      execFileSync(
+        "icacls.exe",
+        [directory, "/inheritance:r", "/grant", `*${user}:(OI)(CI)(M)`],
+        { windowsHide: true, stdio: "ignore" },
+      );
+      writeFileSync(file, JSON.stringify({ pid: process.pid, port: 9224 }));
       grant(file, "S-1-1-0");
       expect(() => verifyWindowsState([directory], file)).toThrow(/ACL/);
 
