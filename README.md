@@ -363,6 +363,14 @@ standalone stdio behavior: it starts the selected local
 Chrome according to the local settings below. A nonblank MCP_PATH without a
 shared URL also remains this local stdio mode.
 
+Every `chrome-devtools-mcp` child the bridge starts, local or proxy, runs with
+`CHROME_DEVTOOLS_MCP_NO_UPDATE_CHECKS=1` and
+`CHROME_DEVTOOLS_MCP_NO_USAGE_STATISTICS=1`, so it neither asks the npm
+registry for a newer version nor sends usage statistics. The stdio transport
+passes that child only a default set of variables, so your own
+`CHROME_DEVTOOLS_MCP_*` settings do not reach it; a shared service you start
+yourself runs with the environment you give it.
+
 `CHROME_DEVTOOLS_AXI_MCP_SERVER_URL` takes precedence over AXI's local Chrome
 launch and attach settings. Run the shared service on the same host and
 filesystem as AXI, keeping the endpoint loopback-only, so saved artifact paths
