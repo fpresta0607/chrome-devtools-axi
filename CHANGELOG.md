@@ -1,5 +1,25 @@
 # Changelog
 
+## [0.1.41](https://github.com/fpresta0607/chrome-devtools-axi/compare/chrome-devtools-axi-v0.1.40...chrome-devtools-axi-v0.1.41) (2026-10-29)
+
+
+### Bug Fixes
+
+* authenticate local bridges and protect per-user state ([5991466](https://github.com/fpresta0607/chrome-devtools-axi/commit/5991466004628fb007dd382a57e36553d26b4e69))
+* **bridge:** authenticate per-user session requests ([7a874db](https://github.com/fpresta0607/chrome-devtools-axi/commit/7a874dbfef0d6db04e6420b6abbc405d56bfa538))
+* **bridge:** recover stale records and cap unauthenticated input ([3f9a387](https://github.com/fpresta0607/chrome-devtools-axi/commit/3f9a3876dd4c60b580dc39672512f0e1d31f6598))
+* **bridge:** turn off chrome-devtools-mcp update checks and telemetry ([f2a1ba4](https://github.com/fpresta0607/chrome-devtools-axi/commit/f2a1ba4518c6d34c0a307071865120bc173e2779))
+* **bridge:** turn off chrome-devtools-mcp update checks and telemetry ([b0d7eef](https://github.com/fpresta0607/chrome-devtools-axi/commit/b0d7eef59cbb9b0264167776a121fac01ef54972))
+* **cli:** make resize report the viewport the page actually has ([#172](https://github.com/fpresta0607/chrome-devtools-axi/issues/172)) ([c0bc93e](https://github.com/fpresta0607/chrome-devtools-axi/commit/c0bc93eb3ea20636c15a215127eeb7a252b7597d))
+* **cli:** select the tab new_page created, not the one matching its URL ([#171](https://github.com/fpresta0607/chrome-devtools-axi/issues/171)) ([9e362df](https://github.com/fpresta0607/chrome-devtools-axi/commit/9e362dfd05dceccdae8356eb8982770f271608ed))
+* **deps:** patch the mcp sdk and build on windows ([2c08327](https://github.com/fpresta0607/chrome-devtools-axi/commit/2c083276889f283144aabe6a3737600ad5d80300))
+* preserve ownership when securing Windows bridge state ([98edcec](https://github.com/fpresta0607/chrome-devtools-axi/commit/98edcec7e86dce9679dd6537fddc1ae731628c7c))
+* **run:** import piped scripts by file URL so run works on Windows ([ca4b104](https://github.com/fpresta0607/chrome-devtools-axi/commit/ca4b1041d6102fc4ad12c208b942a149b422c74f))
+* **run:** import the generated script module by file url ([8408f02](https://github.com/fpresta0607/chrome-devtools-axi/commit/8408f0207ab47490325d06f929aa377777424aff))
+* **windows-acl:** load only built-in modules in the ACL check ([c6398b4](https://github.com/fpresta0607/chrome-devtools-axi/commit/c6398b40184ccd3c27fecb81ad4bccf14dcf9d41))
+* **windows-acl:** load only built-in modules in the ACL check ([66d9270](https://github.com/fpresta0607/chrome-devtools-axi/commit/66d927010036a3791861b959905f27f27047f8ef))
+* **windows-acl:** migrate state without rewriting its owner ([5f75420](https://github.com/fpresta0607/chrome-devtools-axi/commit/5f75420d0581ea09143367ed7f9d4b5e4be7359d))
+
 ## [0.1.40](https://github.com/kunchenguid/chrome-devtools-axi/compare/chrome-devtools-axi-v0.1.39...chrome-devtools-axi-v0.1.40) (2026-10-10)
 
 
