@@ -8,6 +8,7 @@
 import { mkdtempSync, writeFileSync, unlinkSync, rmdirSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
+import { pathToFileURL } from "node:url";
 import { CdpError } from "./client.js";
 import { captureFreshSnapshot, parseUidFresh } from "./uid-freshness.js";
 
@@ -337,7 +338,7 @@ export async function runScript(
   console.log = captureLog;
 
   try {
-    const mod = await import(tmpFile);
+    const mod = await import(pathToFileURL(tmpFile).href);
 
     // Support optional default export function
     if (typeof mod.default === "function") {
