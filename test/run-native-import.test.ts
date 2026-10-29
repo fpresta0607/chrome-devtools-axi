@@ -3,7 +3,7 @@ import { existsSync, mkdtempSync, readdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
-import { afterEach, beforeAll, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it } from "vitest";
 
 /**
  * `runScript` imports the script it writes to a temp file. Vitest resolves a
@@ -17,21 +17,6 @@ const RUN_MODULE = join(ROOT, "dist", "src", "run.js");
 
 const dirs: string[] = [];
 
-beforeAll(() => {
-  // The test spawns the built module, so `pnpm test` on a fresh checkout has
-  // to build first. CI already builds before testing, so this is usually a no-op.
-  if (!existsSync(RUN_MODULE)) {
-    // Through a shell, so Windows finds pnpm's .cmd shim.
-    const built = spawnSync("pnpm run build", {
-      cwd: ROOT,
-      encoding: "utf8",
-      shell: true,
-      windowsHide: true,
-    });
-    expect(built.status, built.stderr).toBe(0);
-  }
-}, 120_000);
-
 afterEach(() => {
   for (const dir of dirs.splice(0)) {
     rmSync(dir, { recursive: true, force: true });
@@ -40,6 +25,7 @@ afterEach(() => {
 
 describe("runScript under Node's own ESM loader", () => {
   it("imports the script it wrote from an absolute temp path", () => {
+    expect(existsSync(RUN_MODULE), "build first: pnpm run build").toBe(true);
     const scriptTmp = mkdtempSync(join(tmpdir(), "cda-run-native-"));
     dirs.push(scriptTmp);
     if (process.platform === "win32") {
