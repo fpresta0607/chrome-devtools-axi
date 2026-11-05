@@ -84,13 +84,6 @@ describe.runIf(process.platform === "win32")(
         verdict: "other",
       },
       {
-        name: "node process that is no bridge, without a listener query",
-        owner: "@{ ReturnValue = 0; Sid = $sid.Value }",
-        target: "other-node",
-        listener: "error",
-        verdict: "other",
-      },
-      {
         name: "confirmed bridge",
         owner: "@{ ReturnValue = 0; Sid = $sid.Value }",
         target: "bridge",
@@ -108,7 +101,7 @@ describe.runIf(process.platform === "win32")(
 function Get-CimInstance {
   param($ClassName, $Namespace, $Filter)
   if ($ClassName -eq 'Win32_Process') {
-    ${target === "error" ? "throw 'CIM unavailable'" : target === "incomplete" ? "[pscustomobject]@{ ProcessId = 123 }" : target === "other-node" ? "[pscustomobject]@{ ExecutablePath = 'C:\\node.exe'; CommandLine = 'node.exe C:\\server.js' }" : "[pscustomobject]@{ ExecutablePath = 'C:\\node.exe'; CommandLine = 'node.exe C:\\chrome-devtools-axi-bridge.js' }"}
+    ${target === "error" ? "throw 'CIM unavailable'" : target === "incomplete" ? "[pscustomobject]@{ ProcessId = 123 }" : "[pscustomobject]@{ ExecutablePath = 'C:\\node.exe'; CommandLine = 'node.exe C:\\chrome-devtools-axi-bridge.js' }"}
   } else {
     ${listener === "error" ? "throw 'CIM unavailable'" : "[pscustomobject]@{ LocalAddress = '127.0.0.1' }"}
   }

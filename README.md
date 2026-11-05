@@ -472,7 +472,7 @@ Requests bind the method, exact path, exact body bytes, timestamp, ambient activ
 Bridge request bodies are limited to 16 MiB and CLI response bodies to 64 MiB.
 
 The key never travels over HTTP and is stored only in the session's protected `bridge.pid` file.
-Windows state directories and key files use owner-only ACLs, checked for current-user ownership and access before the first key write and on every read.
+Windows state directories and key files use owner-only ACLs, checked for current-user ownership and access before the first key write and on every read for use.
 POSIX state directories are prepared with mode `0700` and key files with mode `0600`, with ownership and permission checks before writing or reading a key.
 This boundary protects against other non-admin Windows users on the same machine.
 SYSTEM and administrators remain outside this boundary, as do hostile processes running as the same user.
@@ -486,6 +486,7 @@ Stopping or replacing a live bridge requires protected state and PID verificatio
 On Windows, the PID must belong to the current user's AXI bridge listening on the recorded loopback port.
 A recorded PID that now belongs to another process is treated as a stale record and cleared without terminating that process.
 State with unsafe ownership or links, or a process whose ownership cannot be checked, fails closed.
+The exception is removing a record on Windows, which compares only the recorded PID and still refuses links and hard links.
 Never share or print `bridge.pid` because it contains the session key.
 
 ### Idle timeout

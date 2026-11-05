@@ -43,12 +43,10 @@ try {
       if ($owner.ReturnValue -ne 0 -or [string]::IsNullOrWhiteSpace($owner.Sid)) { throw 'Denied' }
       if ($owner.Sid -eq $sid.Value) {
         if ([string]::IsNullOrWhiteSpace($target.ExecutablePath) -or [string]::IsNullOrWhiteSpace($target.CommandLine)) { throw 'Denied' }
-        # The socket query is the slowest step, so only a likely bridge pays it.
-        if ([System.IO.Path]::GetFileName([string]$target.ExecutablePath) -ieq 'node.exe' -and
-          $target.CommandLine -match '(?i)(?:^|[\\/\s"''])chrome-devtools-axi-bridge\.(?:js|ts)(?:["''\s]|$)') {
-          $listeners = @(Get-CimInstance -Namespace root/StandardCimv2 -ClassName MSFT_NetTCPConnection -Filter ('State = 2 AND LocalPort = ' + [int]$request[2] + ' AND OwningProcess = ' + $processId) | Where-Object { $_.LocalAddress -eq '127.0.0.1' })
-          $isBridge = $listeners.Count -gt 0
-        }
+        $listeners = @(Get-CimInstance -Namespace root/StandardCimv2 -ClassName MSFT_NetTCPConnection -Filter ('State = 2 AND LocalPort = ' + [int]$request[2] + ' AND OwningProcess = ' + $processId) | Where-Object { $_.LocalAddress -eq '127.0.0.1' })
+        $isBridge = [System.IO.Path]::GetFileName([string]$target.ExecutablePath) -ieq 'node.exe' -and
+          $target.CommandLine -match '(?i)(?:^|[\\/\s"''])chrome-devtools-axi-bridge\.(?:js|ts)(?:["''\s]|$)' -and
+          $listeners.Count -gt 0
       }
     }
     [Console]::Out.Write($(if ($isBridge) { 'bridge' } else { 'other' }))
