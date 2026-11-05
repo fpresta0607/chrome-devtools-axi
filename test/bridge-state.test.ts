@@ -36,9 +36,13 @@ vi.mock("node:fs", async (importOriginal) => {
   };
 });
 vi.mock("../src/windows-acl.js", () => ({
-  secureWindowsPath,
-  secureWindowsPaths: (paths: string[], mode: string) =>
-    paths.forEach((path) => secureWindowsPath(path, mode)),
+  secureWindowsPaths: (paths: string[], mode: string, file?: string) => {
+    paths.forEach((path) => secureWindowsPath(path, mode));
+    if (mode === "create-file" && file) {
+      writeFileSync(file, "", { flag: "wx" });
+      secureWindowsPath(file, "verify-file");
+    }
+  },
   verifyWindowsState: (directories: string[], file: string) => {
     directories.forEach((path) => secureWindowsPath(path, "verify-directory"));
     secureWindowsPath(file, "verify-file");
@@ -46,7 +50,7 @@ vi.mock("../src/windows-acl.js", () => ({
 }));
 
 import {
-  prepareSessionState,
+  preparePosixState,
   readBridgeState,
   readBridgeStateForStop,
   removeBridgeState,
@@ -63,7 +67,7 @@ describe("protected bridge state", () => {
     home.value = mkdtempSync(join(tmpdir(), "axi-auth-state-"));
     secureWindowsPath.mockReset();
     secureWindowsPath.mockImplementation((path: string, mode: string) => {
-      if (mode === "prepare-directory") mkdirSync(path, { recursive: true });
+      if (mode === "create-file") mkdirSync(path, { recursive: true });
     });
   });
 
@@ -226,7 +230,7 @@ describe("protected bridge state", () => {
   });
 
   it("rejects legacy state instead of enabling unauthenticated reuse", () => {
-    prepareSessionState("default");
+    writeBridgeState(9224, "a".repeat(64), "default");
     writeFileSync(
       resolveSessionPidFile("default"),
       JSON.stringify({ pid: process.pid, port: 9224 }),
@@ -274,7 +278,7 @@ describe("protected bridge state", () => {
     );
 
     it("rejects a dangling state symlink as unsafe rather than absent", () => {
-      prepareSessionState("default");
+      preparePosixState("default");
       const stateFile = resolveSessionPidFile("default");
       symlinkSync(join(home.value, "missing-state"), stateFile);
 
@@ -334,7 +338,7 @@ describe("protected bridge state", () => {
     );
 
     it("does not migrate a symlinked state file", () => {
-      prepareSessionState("default");
+      preparePosixState("default");
       const target = join(home.value, "other-state");
       writeFileSync(target, JSON.stringify({ pid: process.pid, port: 9224 }));
       chmodSync(target, 0o644);
@@ -410,7 +414,7 @@ describe("protected bridge state", () => {
       const secret = "a".repeat(64);
       let verifiedEmptyFile = false;
       secureWindowsPath.mockImplementation((path: string, mode: string) => {
-        if (mode === "prepare-directory") mkdirSync(path, { recursive: true });
+        if (mode === "create-file") mkdirSync(path, { recursive: true });
         if (mode === "verify-file") {
           expect(readFileSync(path).length).toBe(0);
           verifiedEmptyFile = true;
@@ -449,16 +453,49 @@ describe("protected bridge state", () => {
   );
 
   it.runIf(process.platform === "win32")(
-    "leaves state untouched when cleanup cannot revalidate its token ACL",
+    "removes its own record at shutdown without an ACL launch",
     () => {
       writeBridgeState(9224, "a".repeat(64), "default");
-      secureWindowsPath.mockImplementation((path: string, mode: string) => {
-        if (mode === "verify-file") throw new Error("Unsafe Windows ACL");
+      secureWindowsPath.mockImplementation(() => {
+        throw new Error("Shutdown launched PowerShell");
       });
 
       removePidFile(process.pid, "default");
 
-      expect(existsSync(resolveSessionPidFile("default"))).toBe(true);
+      expect(existsSync(resolveSessionPidFile("default"))).toBe(false);
+    },
+  );
+
+  it.runIf(process.platform === "win32")(
+    "leaves a multiply linked record in place at shutdown",
+    () => {
+      writeBridgeState(9224, "a".repeat(64), "default");
+      const stateFile = resolveSessionPidFile("default");
+      linkSync(stateFile, join(home.value, "linked-state"));
+
+      removePidFile(process.pid, "default");
+
+      expect(existsSync(stateFile)).toBe(true);
+    },
+  );
+
+  it.runIf(process.platform === "win32")(
+    "refuses a junction at the record's path as unsafe at shutdown",
+    () => {
+      writeBridgeState(9224, "a".repeat(64), "default");
+      const stateFile = resolveSessionPidFile("default");
+      const target = join(home.value, "junction-target");
+      mkdirSync(target);
+      writeFileSync(
+        join(target, "bridge.pid"),
+        JSON.stringify({ pid: process.pid, port: 9224 }),
+      );
+      unlinkSync(stateFile);
+      symlinkSync(target, stateFile, "junction");
+
+      expect(() => removeBridgeState(process.pid, "default")).toThrow(/Unsafe/);
+      expect(lstatSync(stateFile).isSymbolicLink()).toBe(true);
+      expect(existsSync(join(target, "bridge.pid"))).toBe(true);
     },
   );
 

@@ -4,6 +4,7 @@ import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { createConnection, createServer, type AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
+import { pathToFileURL } from "node:url";
 import { afterEach, describe, expect, it } from "vitest";
 import { createAuthHeaders } from "../src/bridge-auth.js";
 import { parsePagesList } from "../src/pages.js";
@@ -18,6 +19,11 @@ import { parsePagesList } from "../src/pages.js";
 const ROOT = resolve(import.meta.dirname, "..");
 const BRIDGE_SOURCE = join(ROOT, "bin", "chrome-devtools-axi-bridge.ts");
 const FAKE_MCP = join(import.meta.dirname, "fixtures", "fake-mcp-server.mjs");
+const LAUNCH_COUNTER = join(
+  import.meta.dirname,
+  "fixtures",
+  "count-powershell-launches.mjs",
+);
 const SESSION = "lifecycle-test";
 
 interface RunningBridge {
@@ -66,6 +72,7 @@ function withTimeout<T>(promise: Promise<T>, ms: number, what: string) {
 async function startBridge(
   extraEnv: Record<string, string> = {},
   home = mkdtempSync(join(tmpdir(), "axi-bridge-lifecycle-")),
+  nodeArguments: string[] = [],
 ): Promise<RunningBridge> {
   const mcpPidFile = join(home, "fake-mcp.pid");
   // Drop inherited AXI settings so a developer's own configuration (a shared
@@ -75,21 +82,25 @@ async function startBridge(
       ([key]) => !key.startsWith("CHROME_DEVTOOLS_AXI_"),
     ),
   );
-  const child = spawn(process.execPath, ["--import", "tsx", BRIDGE_SOURCE], {
-    cwd: ROOT,
-    detached: true,
-    windowsHide: true,
-    stdio: ["ignore", "pipe", "pipe"],
-    env: {
-      ...env,
-      HOME: home,
-      USERPROFILE: home,
-      CHROME_DEVTOOLS_AXI_SESSION: SESSION,
-      CHROME_DEVTOOLS_AXI_PORT: String(await freePort()),
-      CHROME_DEVTOOLS_AXI_MCP_PATH: FAKE_MCP,
-      ...extraEnv,
+  const child = spawn(
+    process.execPath,
+    ["--import", "tsx", ...nodeArguments, BRIDGE_SOURCE],
+    {
+      cwd: ROOT,
+      detached: true,
+      windowsHide: true,
+      stdio: ["ignore", "pipe", "pipe"],
+      env: {
+        ...env,
+        HOME: home,
+        USERPROFILE: home,
+        CHROME_DEVTOOLS_AXI_SESSION: SESSION,
+        CHROME_DEVTOOLS_AXI_PORT: String(await freePort()),
+        CHROME_DEVTOOLS_AXI_MCP_PATH: FAKE_MCP,
+        ...extraEnv,
+      },
     },
-  });
+  );
   const exited = new Promise<number | null>((resolveExit) => {
     child.once("exit", (code) => resolveExit(code));
   });
@@ -198,6 +209,39 @@ describe("bridge process lifecycle", () => {
     }
     expect(isAlive(running.mcpPid)).toBe(false);
   }, 90_000);
+
+  it.runIf(process.platform === "win32")(
+    "launches PowerShell once to start and not at all to exit when idle",
+    async () => {
+      const home = mkdtempSync(join(tmpdir(), "axi-bridge-lifecycle-"));
+      const launchLog = join(home, "powershell-launches.log");
+      const countLaunches = () =>
+        readFileSync(launchLog, "utf8").trim().split("\n").length;
+
+      const running = await startBridge(
+        {
+          CHROME_DEVTOOLS_AXI_IDLE_TIMEOUT_MS: "1000",
+          AXI_TEST_POWERSHELL_LAUNCH_LOG: launchLog,
+        },
+        home,
+        ["--import", pathToFileURL(LAUNCH_COUNTER).href],
+      );
+      const launchesToStart = countLaunches();
+      await expect(
+        withTimeout(running.exited, 8_000, "idle bridge exit"),
+      ).resolves.toBe(0);
+
+      expect({
+        launchesToStart,
+        launchesToExit: countLaunches() - launchesToStart,
+      }).toEqual({
+        launchesToStart: 1,
+        launchesToExit: 0,
+      });
+      expect(existsSync(running.pidFile)).toBe(false);
+    },
+    90_000,
+  );
 
   it("shuts down when its MCP server ends", async () => {
     const running = await startBridge();

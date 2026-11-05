@@ -39,15 +39,14 @@ vi.mock("node:child_process", async (importOriginal) => {
 
 const windowsAcl = vi.hoisted(() => ({
   isWindowsBridgeProcess: vi.fn((_pid: number, _port: number) => false),
+  migrateWindowsState: vi.fn(),
   verifyWindowsState: vi.fn(),
 }));
 vi.mock("../src/windows-acl.js", () => ({
-  secureWindowsPaths: (paths: string[], mode: string) => {
-    if (mode === "prepare-directory")
-      paths.forEach((path) => mkdirSync(path, { recursive: true }));
-  },
-  secureWindowsPath: (path: string, mode: string) => {
-    if (mode === "prepare-directory") mkdirSync(path, { recursive: true });
+  secureWindowsPaths: (paths: string[], mode: string, file?: string) => {
+    if (mode === "prepare-directory") windowsAcl.migrateWindowsState();
+    paths.forEach((path) => mkdirSync(path, { recursive: true }));
+    if (mode === "create-file" && file) writeFileSync(file, "", { flag: "wx" });
   },
   verifyWindowsState: windowsAcl.verifyWindowsState,
   isWindowsBridgeProcess: windowsAcl.isWindowsBridgeProcess,
@@ -1048,7 +1047,11 @@ describe("ensureBridge early-exit fast-fail", () => {
       const stateFile = resolveSessionPidFile(session);
       const state = readFileSync(stateFile, "utf8");
       const failure = new Error("Windows bridge ACL verification failed");
-      windowsAcl.verifyWindowsState.mockImplementationOnce(() => {
+      const verification =
+        action === "stop"
+          ? windowsAcl.migrateWindowsState
+          : windowsAcl.verifyWindowsState;
+      verification.mockImplementationOnce(() => {
         if (should_disappear) unlinkSync(stateFile);
         throw failure;
       });
@@ -1073,7 +1076,7 @@ describe("ensureBridge early-exit fast-fail", () => {
           expect(existsSync(stateFile)).toBe(false);
         }
       } finally {
-        windowsAcl.verifyWindowsState.mockReset();
+        verification.mockReset();
         listener.closeAllConnections();
         await new Promise<void>((closed) => listener.close(() => closed()));
       }
