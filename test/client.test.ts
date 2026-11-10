@@ -1392,7 +1392,10 @@ describe("terminateBridgeProcess", () => {
         "-e",
         [
           "const { spawn } = require('node:child_process');",
-          "const child = spawn(process.execPath, ['-e', 'setTimeout(() => {}, 30000)'], { stdio: 'ignore', windowsHide: true });",
+          // On Windows, libuv puts every non-detached child in a kill-on-close
+          // job object, so the grandchild would die when its parent exits,
+          // whatever terminateBridgeProcess does.
+          "const child = spawn(process.execPath, ['-e', 'setTimeout(() => {}, 30000)'], { stdio: 'ignore', windowsHide: true, detached: process.platform === 'win32' });",
           `require('node:fs').writeFileSync(${JSON.stringify(childPidFile)}, String(child.pid));`,
           "process.on('SIGTERM', () => {});",
           "setTimeout(() => {}, 30000);",
