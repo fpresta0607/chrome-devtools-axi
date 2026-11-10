@@ -214,6 +214,9 @@ describe.runIf(process.platform === "win32")("Windows ACL enforcement", () => {
       writeFileSync(file, "", { flag: "wx" });
 
       expect(() => verifyWindowsState([directory], file)).not.toThrow();
+      // A temp directory under the user profile may already grant only this
+      // user, SYSTEM and Administrators, so open it to Users explicitly.
+      grant(home, "S-1-5-32-545");
       expect(() => verifyWindowsState([home], file)).toThrow(/ACL/);
       expect(() => verifyWindowsState([directory], directory)).toThrow(/ACL/);
     } finally {
