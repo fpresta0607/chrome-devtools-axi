@@ -146,10 +146,9 @@ async function proveOwner() {
   const { createBridgeServer } = await import(
     pathToFileURL(join(repository, "dist", "src", "bridge.js")).href
   );
-  const { prepareSessionState, writeBridgeState, readBridgeState } =
-    await import(
-      pathToFileURL(join(repository, "dist", "src", "bridge-state.js")).href
-    );
+  const { writeBridgeState, readBridgeState } = await import(
+    pathToFileURL(join(repository, "dist", "src", "bridge-state.js")).href
+  );
   const { resolveSessionPidFile } = await import(
     pathToFileURL(join(repository, "dist", "src", "sessions.js")).href
   );
@@ -186,7 +185,6 @@ async function proveOwner() {
     }
     for (const session of ["default", "cross-user-proof"]) {
       process.env.CHROME_DEVTOOLS_AXI_SESSION = session;
-      await prepareSessionState(session);
       const secret = randomBytes(32).toString("hex");
       bridgeSecrets.push(secret);
       const server = createBridgeServer(

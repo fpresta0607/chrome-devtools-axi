@@ -20,11 +20,7 @@ import {
   resolveSessionStateDir,
   validateSessionName,
 } from "./sessions.js";
-import {
-  secureWindowsPath,
-  secureWindowsPaths,
-  verifyWindowsState,
-} from "./windows-acl.js";
+import { secureWindowsPaths, verifyWindowsState } from "./windows-acl.js";
 
 export interface BridgeState {
   pid: number;
@@ -35,6 +31,8 @@ export interface BridgeState {
 
 const UNSAFE_STATE_MESSAGE =
   "Unsafe bridge state permissions. Run stop, then start this session";
+
+type StateAccess = "read" | "migrate" | "remove";
 
 function stateDirectories(sessionName: string): string[] {
   validateSessionName(sessionName);
@@ -66,13 +64,8 @@ function verifyPosixPath(
   }
 }
 
-export function prepareSessionState(sessionName = resolveSessionName()): void {
-  const directories = stateDirectories(sessionName);
-  if (process.platform === "win32") {
-    secureWindowsPaths(directories, "prepare-directory");
-    return;
-  }
-  for (const path of directories) {
+export function preparePosixState(sessionName = resolveSessionName()): void {
+  for (const path of stateDirectories(sessionName)) {
     try {
       mkdirSync(path, { mode: 0o700 });
     } catch (error) {
@@ -89,26 +82,28 @@ export function prepareSessionState(sessionName = resolveSessionName()): void {
 
 function readState(
   sessionName: string,
-  should_migrate = false,
+  access: StateAccess = "read",
 ): Record<string, unknown> | null {
   const directories = stateDirectories(sessionName);
   const path = resolveSessionPidFile(sessionName);
   try {
-    if (!lstatSync(path, { throwIfNoEntry: false })) return null;
-    if (should_migrate) {
-      if (process.platform === "win32") {
-        if (lstatSync(path).nlink !== 1) throw new Error(UNSAFE_STATE_MESSAGE);
+    const info = lstatSync(path, { throwIfNoEntry: false });
+    if (!info) return null;
+    if (process.platform === "win32") {
+      if (!info.isFile() || info.nlink !== 1)
+        throw new Error(UNSAFE_STATE_MESSAGE);
+      // Removal only compares the recorded pid and trusts nothing it reads, and
+      // the record's secret ends with its bridge, so a shutdown does not wait on
+      // a PowerShell launch.
+      if (access === "migrate")
         secureWindowsPaths(directories, "prepare-directory", path);
-      } else {
+      else if (access === "read") verifyWindowsState(directories, path);
+    } else {
+      if (access === "migrate") {
         for (const directory of directories)
           verifyPosixPath(directory, true, true);
         verifyPosixPath(path, false, true);
       }
-    }
-    if (process.platform === "win32") {
-      if (lstatSync(path).nlink !== 1) throw new Error(UNSAFE_STATE_MESSAGE);
-      verifyWindowsState(directories, path);
-    } else {
       for (const directory of directories) verifyPosixPath(directory, true);
       verifyPosixPath(path, false);
     }
@@ -128,11 +123,9 @@ function readState(
   }
 }
 
-export function readBridgeStateForStop(
-  sessionName = resolveSessionName(),
-  should_migrate = false,
+function parseStopState(
+  data: Record<string, unknown> | null,
 ): { pid: number; port: number } | null {
-  const data = readState(sessionName, should_migrate);
   if (!data) return null;
   if (
     !Number.isSafeInteger(data.pid) ||
@@ -144,6 +137,15 @@ export function readBridgeStateForStop(
     throw new Error("Invalid authenticated bridge state");
   }
   return { pid: Number(data.pid), port: Number(data.port) };
+}
+
+export function readBridgeStateForStop(
+  sessionName = resolveSessionName(),
+  should_migrate = false,
+): { pid: number; port: number } | null {
+  return parseStopState(
+    readState(sessionName, should_migrate ? "migrate" : "read"),
+  );
 }
 
 export function readBridgeState(
@@ -188,15 +190,22 @@ export function writeBridgeState(
     port > 65535
   )
     throw new Error("Invalid authenticated bridge state");
-  prepareSessionState(sessionName);
   const destination = resolveSessionPidFile(sessionName);
   const temporary = `${destination}.${process.pid}.${randomBytes(8).toString("hex")}.tmp`;
-  const descriptor = openSync(temporary, "wx", 0o600);
+  const is_windows = process.platform === "win32";
+  if (!is_windows) preparePosixState(sessionName);
   try {
+    // One launch secures the directories and verifies the empty file before the
+    // secret reaches it, so bridge startup pays for a single PowerShell.
+    if (is_windows)
+      secureWindowsPaths(
+        stateDirectories(sessionName),
+        "create-file",
+        temporary,
+      );
+    const descriptor = openSync(temporary, is_windows ? "r+" : "wx", 0o600);
     try {
-      if (process.platform === "win32")
-        secureWindowsPath(temporary, "verify-file");
-      else verifyPosixPath(temporary, false);
+      if (!is_windows) verifyPosixPath(temporary, false);
       writeFileSync(
         descriptor,
         JSON.stringify({
@@ -219,7 +228,7 @@ export function removeBridgeState(
   pid: number,
   sessionName = resolveSessionName(),
 ): void {
-  const state = readBridgeStateForStop(sessionName);
+  const state = parseStopState(readState(sessionName, "remove"));
   if (state?.pid === pid) {
     const path = resolveSessionPidFile(sessionName);
     try {

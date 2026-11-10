@@ -1,6 +1,12 @@
 import { execFileSync } from "node:child_process";
+import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { isWindowsBridgeProcess } from "../src/windows-acl.js";
+import {
+  isWindowsBridgeProcess,
+  secureWindowsPaths,
+} from "../src/windows-acl.js";
 
 vi.mock("node:child_process", async (importOriginal) => {
   const childProcess =
@@ -131,5 +137,52 @@ function Invoke-CimMethod {
         }
       },
     );
+
+    it("rejects a directory with a clean ACL that another identity owns", async () => {
+      const childProcess =
+        await vi.importActual<typeof import("node:child_process")>(
+          "node:child_process",
+        );
+      const home = mkdtempSync(join(tmpdir(), "axi-windows-owner-"));
+      const directory = join(home, "state");
+      const icacls = (...args: string[]) =>
+        childProcess.execFileSync("icacls.exe", [directory, ...args], {
+          windowsHide: true,
+          stdio: "ignore",
+        });
+      const identity =
+        "[System.Security.Principal.WindowsIdentity]::GetCurrent().User";
+      let has_replaced_identity = false;
+      mkdirSync(directory);
+      // The ACL grants only SYSTEM, and the script below takes SYSTEM for its
+      // caller, so the real user's ownership is all there is left to reject.
+      icacls("/inheritance:r", "/grant", "*S-1-5-18:(OI)(CI)(F)");
+      vi.mocked(execFileSync).mockImplementationOnce((file, args, options) => {
+        if (!Array.isArray(args))
+          throw new Error("Expected PowerShell arguments");
+        const index = args.indexOf("-EncodedCommand") + 1;
+        const script = Buffer.from(args[index], "base64").toString("utf16le");
+        has_replaced_identity = script.includes(identity);
+        const injected = [...args];
+        injected[index] = Buffer.from(
+          script.replace(
+            identity,
+            "[System.Security.Principal.SecurityIdentifier]::new('S-1-5-18')",
+          ),
+          "utf16le",
+        ).toString("base64");
+        return childProcess.execFileSync(file, injected, options);
+      });
+
+      try {
+        expect(() =>
+          secureWindowsPaths([directory], "verify-directory"),
+        ).toThrow(/verification failed/);
+        expect(has_replaced_identity).toBe(true);
+      } finally {
+        icacls("/reset");
+        rmSync(home, { recursive: true, force: true });
+      }
+    }, 20_000);
   },
 );

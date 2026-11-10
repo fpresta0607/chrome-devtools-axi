@@ -14,7 +14,6 @@ import { join, resolve } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   isWindowsBridgeProcess,
-  secureWindowsPath,
   secureWindowsPaths,
   verifyWindowsState,
 } from "../src/windows-acl.js";
@@ -54,10 +53,6 @@ describe.runIf(process.platform === "win32")("Windows ACL enforcement", () => {
         expect(() => verifyWindowsState([directory], file)).toThrow(/ACL/);
         secureWindowsPaths([directory], "prepare-directory", file);
 
-        expect(() =>
-          secureWindowsPath(directory, "verify-directory"),
-        ).not.toThrow();
-        expect(() => secureWindowsPath(file, "verify-file")).not.toThrow();
         expect(() => verifyWindowsState([directory], file)).not.toThrow();
         expect(readFileSync(file, "utf8")).toBe("legacy state");
         expect(isWindowsBridgeProcess(process.pid, 9224)).toBe(false);
@@ -150,9 +145,61 @@ describe.runIf(process.platform === "win32")("Windows ACL enforcement", () => {
           join(directory, "bridge.pid"),
         ),
       ).toThrow(/ACL/);
-      expect(() => secureWindowsPath(target, "verify-directory")).toThrow(
+      expect(() => secureWindowsPaths([target], "verify-directory")).toThrow(
         /ACL/,
       );
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
+  }, 20_000);
+
+  it("creates an empty token file inside newly protected directories", () => {
+    const home = mkdtempSync(join(tmpdir(), "axi-windows-acl-"));
+    const directory = join(home, "protected-state");
+    const file = join(directory, "bridge.pid.tmp");
+    try {
+      secureWindowsPaths([directory], "create-file", file);
+
+      expect(readFileSync(file, "utf8")).toBe("");
+      expect(() => verifyWindowsState([directory], file)).not.toThrow();
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
+  }, 20_000);
+
+  it("refuses to create a token file over an existing file", () => {
+    const home = mkdtempSync(join(tmpdir(), "axi-windows-acl-"));
+    const directory = join(home, "protected-state");
+    const file = join(directory, "bridge.pid.tmp");
+    try {
+      secureWindowsPaths([directory], "prepare-directory");
+      writeFileSync(file, "existing");
+
+      expect(() =>
+        secureWindowsPaths([directory], "create-file", file),
+      ).toThrow(/ACL/);
+      expect(readFileSync(file, "utf8")).toBe("existing");
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
+  }, 20_000);
+
+  it("refuses to create a token file through a directory junction", () => {
+    const home = mkdtempSync(join(tmpdir(), "axi-windows-acl-"));
+    const target = join(home, "target");
+    const directory = join(home, "state-junction");
+    try {
+      mkdirSync(target);
+      symlinkSync(target, directory, "junction");
+
+      expect(() =>
+        secureWindowsPaths(
+          [directory],
+          "create-file",
+          join(directory, "bridge.pid.tmp"),
+        ),
+      ).toThrow(/ACL/);
+      expect(existsSync(join(target, "bridge.pid.tmp"))).toBe(false);
     } finally {
       rmSync(home, { recursive: true, force: true });
     }
@@ -162,15 +209,14 @@ describe.runIf(process.platform === "win32")("Windows ACL enforcement", () => {
     const home = mkdtempSync(join(tmpdir(), "axi-windows-acl-"));
     const directory = join(home, "protected-state");
     try {
-      secureWindowsPath(directory, "prepare-directory");
+      secureWindowsPaths([directory], "prepare-directory");
       const file = join(directory, "empty-token");
       writeFileSync(file, "", { flag: "wx" });
 
-      expect(() =>
-        secureWindowsPath(directory, "verify-directory"),
-      ).not.toThrow();
-      expect(() => secureWindowsPath(file, "verify-file")).not.toThrow();
       expect(() => verifyWindowsState([directory], file)).not.toThrow();
+      // A temp directory under the user profile may already grant only this
+      // user, SYSTEM and Administrators, so open it to Users explicitly.
+      grant(home, "S-1-5-32-545");
       expect(() => verifyWindowsState([home], file)).toThrow(/ACL/);
       expect(() => verifyWindowsState([directory], directory)).toThrow(/ACL/);
     } finally {
@@ -189,19 +235,19 @@ describe.runIf(process.platform === "win32")("Windows ACL enforcement", () => {
       const home = mkdtempSync(join(tmpdir(), "axi-windows-acl-"));
       const directory = join(home, "protected-state");
       const file = join(directory, "token");
+      const untouchedFile = join(directory, "untouched-token");
       try {
-        secureWindowsPath(directory, "prepare-directory");
-        writeFileSync(file, "", { flag: "wx" });
-        expect(() => verifyWindowsState([directory], file)).not.toThrow();
+        secureWindowsPaths([directory], "create-file", file);
+        writeFileSync(untouchedFile, "", { flag: "wx" });
+        expect(() =>
+          verifyWindowsState([directory], untouchedFile),
+        ).not.toThrow();
 
         grant(file, sid);
         expect(() => verifyWindowsState([directory], file)).toThrow(/ACL/);
-        expect(() =>
-          secureWindowsPath(directory, "verify-directory"),
-        ).not.toThrow();
 
         grant(directory, sid);
-        expect(() => secureWindowsPath(directory, "verify-directory")).toThrow(
+        expect(() => verifyWindowsState([directory], untouchedFile)).toThrow(
           /ACL/,
         );
       } finally {
@@ -215,11 +261,11 @@ describe.runIf(process.platform === "win32")("Windows ACL enforcement", () => {
     const home = mkdtempSync(join(tmpdir(), "axi-windows-acl-"));
     const directory = join(home, "état-Grüße-用户");
     try {
-      secureWindowsPath(directory, "prepare-directory");
+      secureWindowsPaths([directory], "prepare-directory");
 
       expect(existsSync(directory)).toBe(true);
       expect(() =>
-        secureWindowsPath(directory, "verify-directory"),
+        secureWindowsPaths([directory], "verify-directory"),
       ).not.toThrow();
     } finally {
       rmSync(home, { recursive: true, force: true });

@@ -41,11 +41,7 @@ import {
   RESPONSE_PROOF_HEADER,
   type BridgeAuth,
 } from "./bridge-auth.js";
-import {
-  prepareSessionState,
-  removeBridgeState,
-  writeBridgeState,
-} from "./bridge-state.js";
+import { removeBridgeState, writeBridgeState } from "./bridge-state.js";
 import {
   AMBIENT_REQUEST_HEADER,
   BRIDGE_PORT_IN_USE_EXIT_CODE,
@@ -181,7 +177,7 @@ export function removePidFile(
   try {
     removeBridgeState(ownerPid, sessionName);
   } catch {
-    // Unverified state must remain untouched during shutdown.
+    // A record this bridge cannot read as its own stays for `stop` to handle.
   }
 }
 
@@ -1221,7 +1217,6 @@ async function closeServer(server: Server): Promise<void> {
 
 export async function runBridge(port = resolveSessionPort()): Promise<void> {
   const sessionName = resolveSessionName();
-  prepareSessionState(sessionName);
   const secret = randomBytes(32).toString("hex");
   // Connect the selected MCP transport before binding the port. In local and
   // proxy modes this may spawn chrome-devtools-mcp; URL-only shared mode
