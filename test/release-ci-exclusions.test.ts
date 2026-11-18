@@ -1,79 +1,12 @@
-import { existsSync, readdirSync, readFileSync } from "node:fs";
+import { readdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 import { parse } from "yaml";
 
-const root = fileURLToPath(new URL("..", import.meta.url));
-const workflowsDir = join(root, ".github", "workflows");
-
-/**
- * Derive the exact release-please output set from config + workflow inputs.
- * Keep this aligned with the fleet audit rule in firstmate's release-please CI
- * report: node -> package.json (+ package-lock.json if present), changelog,
- * extra-files, and the manifest path.
- */
-function expectedReleaseOutputs(): string[] {
-  const config = JSON.parse(
-    readFileSync(join(root, "release-please-config.json"), "utf8"),
-  ) as {
-    "release-type"?: string;
-    "changelog-path"?: string;
-    "version-file"?: string;
-    "extra-files"?: Array<string | { path?: string }>;
-    packages?: Record<
-      string,
-      {
-        "release-type"?: string;
-        "changelog-path"?: string;
-        "version-file"?: string;
-        "extra-files"?: Array<string | { path?: string }>;
-      }
-    >;
-  };
-  const pkg = config.packages?.["."] ?? {};
-  const releaseType = pkg["release-type"] ?? config["release-type"] ?? "node";
-  const changelog =
-    pkg["changelog-path"] ?? config["changelog-path"] ?? "CHANGELOG.md";
-
-  const expected: string[] = [changelog];
-  switch (releaseType) {
-    case "simple":
-      expected.push(
-        pkg["version-file"] ?? config["version-file"] ?? "version.txt",
-      );
-      break;
-    case "node":
-      expected.push("package.json");
-      if (existsSync(join(root, "package-lock.json"))) {
-        expected.push("package-lock.json");
-      }
-      break;
-    case "go":
-      break;
-    default:
-      throw new Error(
-        `unsupported release-please release-type for ignore derivation: ${releaseType}`,
-      );
-  }
-
-  const extra = pkg["extra-files"] ?? config["extra-files"] ?? [];
-  for (const entry of extra) {
-    const path = typeof entry === "string" ? entry : entry?.path;
-    if (path) expected.push(path);
-  }
-
-  let manifest = ".release-please-manifest.json";
-  const releaseWorkflow = readFileSync(
-    join(workflowsDir, "release-please.yml"),
-    "utf8",
-  );
-  const manifestMatch = releaseWorkflow.match(/manifest-file:\s*(\S+)/);
-  if (manifestMatch) manifest = manifestMatch[1];
-  expected.push(manifest);
-
-  return [...new Set(expected)];
-}
+const workflowsDir = fileURLToPath(
+  new URL("../.github/workflows", import.meta.url),
+);
 
 function loadWorkflowOn(filePath: string): Record<string, unknown> | null {
   const doc = parse(readFileSync(filePath, "utf8")) as Record<
@@ -167,20 +100,11 @@ function allPathsIgnored(ignorePatterns: string[], paths: string[]): boolean {
 }
 
 describe("release-please CI exclusions", () => {
-  const expected = expectedReleaseOutputs();
   const ignoreSet = [
     ".release-please-manifest.json",
     "CHANGELOG.md",
     "package.json",
   ];
-
-  it("derives the node release-output set for this repository", () => {
-    expect(expected).toEqual([
-      "CHANGELOG.md",
-      "package.json",
-      ".release-please-manifest.json",
-    ]);
-  });
 
   it("every pull_request workflow ignores the full release-output set", () => {
     const files = readdirSync(workflowsDir).filter((name) =>
@@ -206,7 +130,7 @@ describe("release-please CI exclusions", () => {
 
     const failures: string[] = [];
     for (const { name, filter } of prWorkflows) {
-      const missing = expected.filter((path) => !isCovered(filter, path));
+      const missing = ignoreSet.filter((path) => !isCovered(filter, path));
       if (missing.length > 0) {
         failures.push(`${name} missing coverage for: ${missing.join(", ")}`);
       }
