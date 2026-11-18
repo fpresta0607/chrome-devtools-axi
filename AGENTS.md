@@ -35,7 +35,7 @@ pnpm run test:watch  # vitest watch mode
 
 Run one file: `pnpm test test/cli.test.ts`. Filter by name: `pnpm test -- -t "formatStopOutput"`. Check formatting: `pnpm exec prettier --check .`.
 Run `pnpm run build` and `pnpm test` before pushing.
-Do not hand-edit `CHANGELOG.md`, `.release-please-manifest.json`, or `skills/chrome-devtools-axi/SKILL.md`. Update `src/skill.ts` and run `pnpm run build:skill`. Generated files are listed in `.prettierignore`; validate them with their generator checks. Keep `skills/chrome-devtools-axi/` in the npm `files` list.
+Do not hand-edit `CHANGELOG.md` or `skills/chrome-devtools-axi/SKILL.md`. Update `src/skill.ts` and run `pnpm run build:skill`. Generated files are listed in `.prettierignore`; validate them with their generator checks. Keep `skills/chrome-devtools-axi/` in the npm `files` list.
 
 ## Release and the contribution gate
 

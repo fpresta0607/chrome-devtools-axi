@@ -1,6 +1,5 @@
 # Generated files - owned by their generators, not prettier.
 CHANGELOG.md
-.release-please-manifest.json
 skills/chrome-devtools-axi/SKILL.md
 .agents/skills/no-mistakes/SKILL.md
 # Local (untracked) agent settings.
